@@ -1,0 +1,1 @@
+sudo bash scripts/setup-laravel-virtualmin.sh --domain fema.sk --user fema --db-pass 'SILNE_HESLO' --dry-run
