@@ -368,6 +368,7 @@ ensure_laravel_project() {
 ensure_migration() {
   local pattern="$1"
   local cmd="$2"
+  local required="${3:-1}"
 
   shopt -s nullglob
   local files=("${APP_DIR}"/database/migrations/*_"${pattern}".php)
@@ -378,7 +379,13 @@ ensure_migration() {
       shopt -s nullglob
       files=("${APP_DIR}"/database/migrations/*_"${pattern}".php)
       shopt -u nullglob
-      [[ ${#files[@]} -gt 0 ]] || die "Nepodarilo sa vytvoriť migration ${pattern}"
+      if [[ ${#files[@]} -eq 0 ]]; then
+        if [[ "$required" == "0" ]]; then
+          warn "Nepodarilo sa vytvoriť voliteľnú migration ${pattern}. Pokračujem bez nej."
+          return 0
+        fi
+        die "Nepodarilo sa vytvoriť migration ${pattern}"
+      fi
     fi
   fi
 }
@@ -632,9 +639,9 @@ PY
 fi
 
 if [[ $DRY_RUN -eq 0 ]]; then
-  ensure_migration "create_jobs_table" "php artisan make:queue-table"
-  ensure_migration "create_job_batches_table" "php artisan make:queue-batches-table"
-  ensure_migration "create_failed_jobs_table" "php artisan make:queue-failed-table"
+  ensure_migration "create_jobs_table" "php artisan make:queue-table" 1
+  ensure_migration "create_job_batches_table" "php artisan make:queue-batches-table" 0
+  ensure_migration "create_failed_jobs_table" "php artisan make:queue-failed-table" 1
 else
   echo "+ ensure queue migration files exist"
 fi
