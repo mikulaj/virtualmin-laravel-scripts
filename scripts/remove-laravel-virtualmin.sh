@@ -11,8 +11,8 @@ Použitie:
     --user nbv
 
 Voliteľné:
-  --db-name NAME            default: <user>_matrika
-  --db-user NAME            default: <user>_matrika_user
+  --db-name NAME            default: <user>
+  --db-user NAME            default: <user>
   --app-dir PATH            default: /home/<user>/laravel-app
   --drop-db                 zmaže PostgreSQL databázu
   --drop-role               zmaže PostgreSQL rolu / usera
@@ -67,8 +67,8 @@ done
 [[ $EUID -eq 0 ]] || { echo "Skript spusti ako root." >&2; exit 1; }
 [[ -n "$DOMAIN" && -n "$DOMAIN_USER" ]] || { usage; exit 1; }
 
-DB_NAME="${DB_NAME:-${DOMAIN_USER}_matrika}"
-DB_USER="${DB_USER:-${DOMAIN_USER}_matrika_user}"
+DB_NAME="${DB_NAME:-${DOMAIN_USER}}"
+DB_USER="${DB_USER:-${DOMAIN_USER}}"
 APP_DIR="${APP_DIR:-/home/${DOMAIN_USER}/laravel-app}"
 NGINX_CONF="/etc/nginx/sites-available/${DOMAIN}.conf"
 NGINX_ENABLED="/etc/nginx/sites-enabled/${DOMAIN}.conf"

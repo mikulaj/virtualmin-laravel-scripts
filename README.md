@@ -53,10 +53,10 @@ Ak nezadáš `--db-pass` a `--admin-pass`, skript ich vygeneruje automaticky.
   systémový používateľ domény, napr. `nbv`
 
 - `--db-name NAME`  
-  default: `<user>_matrika`
+  default: `<user>`
 
 - `--db-user NAME`  
-  default: `<user>_matrika_user`
+  default: `<user>`
 
 - `--db-pass PASS`  
   PostgreSQL heslo; ak chýba, skript ho vygeneruje
@@ -193,8 +193,8 @@ Hotovo. Ďalšie kroky:
    Email: admin@nbv.sk
    Heslo: ...
 3) Databázové údaje:
-   DB name: nbv_matrika
-   DB user: nbv_matrika_user
+   DB name: nbv
+   DB user: nbv
    DB pass: ...
 4) Uložené aj do root súboru: /root/nbv.sk-deploy-credentials-YYYYMMDD-HHMMSS.txt
 ```
