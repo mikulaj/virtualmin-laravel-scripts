@@ -1,319 +1,246 @@
-# README - setup-laravel-virtualmin.sh
+# Virtualmin Laravel Scripts
 
-Tento skript je určený na **čisté alebo takmer čisté nasadenie Laravel + Filament + PostgreSQL** na **už existujúcej Virtualmin doméne** s Nginx.
+Parametrický Bash skript na nasadenie **Laravel + Filament + PostgreSQL** na **existujúcej Virtualmin doméne** s **Nginx**.
 
-Je robený tak, aby aplikačné kroky bežali správne cez používateľa domény, napríklad:
+Skript je určený na rýchly prvý deploy aj na opakované pokusy pri testovaní. Vie pripraviť Laravel projekt, PostgreSQL databázu, Nginx konfiguráciu, Supervisor worker, cron a voliteľne aj prvého Filament admin používateľa.
 
-```bash
-su - fema
-```
+## Čo skript robí
 
-nie ako `root`.
-
----
-
-## Na čo je skript určený
-
-Skript automatizuje tieto kroky:
-
-- overenie / doinštalovanie potrebných balíkov
-- vytvorenie PostgreSQL databázy a používateľa
-- vytvorenie Laravel projektu
-- vytvorenie `.env`
-- inštaláciu Livewire a Filament
-- opravu `AdminPanelProvider.php`
-- opravu `User.php` kvôli Filament 403 po prihlásení
-- Laravel migrácie
-- `storage:link`
-- frontend build cez npm
-- opravu Nginx root na Laravel `public`
-- cron pre scheduler
-- Supervisor pre queue worker
-
----
+- overí prostredie a potrebné služby
+- vie doinštalovať potrebné balíky, ak nepoužiješ `--skip-packages`
+- vytvorí alebo obnoví PostgreSQL databázu a rolu
+- vytvorí nový Laravel projekt
+- doinštaluje Livewire a Filament
+- nastaví `.env`
+- vygeneruje silné heslá, ak ich nezadáš ručne
+- vytvorí prvého admin používateľa do Filamentu
+- publikuje **Filament assety**
+- overí existenciu Filament CSS/JS súborov
+- nastaví alebo opraví Nginx pre Laravel
+- nastaví cron pre `schedule:run`
+- nastaví Supervisor worker pre queue
+- uloží prihlasovacie údaje do root-only súboru v `/root`
 
 ## Predpoklady
 
-Pred spustením skriptu musí platiť:
+- doména už existuje vo Virtualmine
+- systémový používateľ domény už existuje
+- Nginx a PHP-FPM sú používané pre web
+- skript spúšťaš ako `root`
 
-1. Virtualmin doména už existuje.
-2. Existuje systémový používateľ domény, napríklad `fema`.
-3. Existuje Nginx config domény:
-   - `/etc/nginx/sites-available/<domena>.conf`
-4. Skript spúšťaš ako `root`.
-5. DNS a SSL riešiš samostatne.
+## Hlavný skript
 
----
-
-## Čo skript nerieši
-
-Skript zámerne nerieši:
-
-- vytvorenie Virtualmin domény
-- DNS záznamy
-- vystavenie SSL certifikátu
-- vytvorenie Filament admin používateľa interaktívne
-
-Po dobehnutí skriptu admin usera vytvoríš ručne.
-
----
+`scripts/setup-laravel-virtualmin.sh`
 
 ## Základné použitie
 
 ```bash
-sudo bash setup-laravel-virtualmin.sh \
-  --domain fema.sk \
-  --user fema \
-  --db-pass 'SILNE_HESLO'
+sudo bash scripts/setup-laravel-virtualmin.sh \
+  --domain nbv.sk \
+  --user nbv
 ```
 
----
+Ak nezadáš `--db-pass` a `--admin-pass`, skript ich vygeneruje automaticky.
 
-## Parametre
+## Dôležité prepínače
 
-### Povinné
+### Základné
 
-- `--domain` - doména, napr. `fema.sk`
-- `--user` - systémový používateľ domény, napr. `fema`
-- `--db-pass` - heslo pre PostgreSQL používateľa
+- `--domain DOMAIN`  
+  názov domény, napr. `nbv.sk`
 
-### Voliteľné
+- `--user USER`  
+  systémový používateľ domény, napr. `nbv`
 
-- `--db-name` - názov databázy
-  - default: `<user>_matrika`
-- `--db-user` - názov DB používateľa
-  - default: `<user>_matrika_user`
-- `--app-dir` - cieľový adresár aplikácie
-  - default: `/home/<user>/laravel-app`
-- `--php-version` - verzia PHP
-  - default: `8.4`
-- `--skip-packages` - nebeží `apt install`
-- `--dry-run
-- `--skip-cert-check` preskočí záverečný test HTTPS certifikátu` - iba vypíše kroky, nič nemení
+- `--db-name NAME`  
+  default: `<user>_matrika`
 
----
+- `--db-user NAME`  
+  default: `<user>_matrika_user`
 
-## Príklady
+- `--db-pass PASS`  
+  PostgreSQL heslo; ak chýba, skript ho vygeneruje
 
-### Minimálny príklad
+- `--app-dir PATH`  
+  default: `/home/<user>/laravel-app`
+
+- `--php-version VERSION`  
+  default: `8.4`
+
+- `--skip-packages`  
+  preskočí `apt install`
+
+- `--skip-cert-check`  
+  preskočí kontrolu HTTPS certifikátu na konci
+
+- `--dry-run`  
+  iba vypíše kroky bez vykonania zmien
+
+### Admin používateľ
+
+- `--no-admin`  
+  nevytvorí prvého admin používateľa
+
+- `--admin-name NAME`  
+  default: `Administrator`
+
+- `--admin-email EMAIL`  
+  default: `admin@<domain>`
+
+- `--admin-pass PASS`  
+  ak chýba, skript ho vygeneruje
+
+### Reset pred novým deployom
+
+- `--reset-first`  
+  zmaže starý Laravel pokus pred novým deployom
+
+- `--reset-drop-db`  
+  pri resetovaní zmaže aj PostgreSQL databázu
+
+- `--reset-drop-role`  
+  pri resetovaní zmaže aj PostgreSQL rolu / usera
+
+- `--reset-yes`  
+  reset prebehne bez interaktívneho potvrdenia
+
+## Odporúčaný postup
+
+### 1. Test nanečisto
 
 ```bash
-sudo bash setup-laravel-virtualmin.sh \
-  --domain fema.sk \
-  --user fema \
-  --db-pass 'MojeSilneHeslo'
-```
-
-### Vlastná DB a vlastný app adresár
-
-```bash
-sudo bash setup-laravel-virtualmin.sh \
-  --domain fema.sk \
-  --user fema \
-  --db-pass 'MojeSilneHeslo' \
-  --db-name fema_app \
-  --db-user fema_app_user \
-  --app-dir /home/fema/apps/matrika
-```
-
-### Test bez zásahu
-
-```bash
-sudo bash setup-laravel-virtualmin.sh \
-  --domain fema.sk \
-  --user fema \
-  --db-pass 'MojeSilneHeslo' \
+bash scripts/setup-laravel-virtualmin.sh \
+  --domain nbv.sk \
+  --user nbv \
+  --skip-packages \
   --dry-run
-- `--skip-cert-check` preskočí záverečný test HTTPS certifikátu
 ```
 
----
+### 2. Prvý ostrý deploy
 
-## Odporúčaný postup použitia
+```bash
+bash scripts/setup-laravel-virtualmin.sh \
+  --domain nbv.sk \
+  --user nbv
+```
 
-1. skontrolovať, že Virtualmin doména už existuje
-2. spraviť `--dry-run
-- `--skip-cert-check` preskočí záverečný test HTTPS certifikátu`
-3. spraviť zálohu nginx configu a databáz, ak ide o starší server
-4. spustiť skript na testovacej alebo starej doméne
-5. po úspechu spustiť na novej doméne
+### 3. Opakovaný čistý pokus
 
----
+```bash
+bash scripts/setup-laravel-virtualmin.sh \
+  --domain nbv.sk \
+  --user nbv \
+  --skip-packages \
+  --reset-first \
+  --reset-drop-db \
+  --reset-drop-role \
+  --reset-yes
+```
 
-## Čo skript mení
+### 4. Oprava Nginx / SSL po vystavení certifikátu
 
-### Laravel adresár
+Ak už projekt existuje a potrebuješ len dorobiť HTTPS konfiguráciu po vystavení certifikátu vo Virtualmine, spusti skript znova **bez resetu**:
 
-Default:
+```bash
+bash scripts/setup-laravel-virtualmin.sh \
+  --domain nbv.sk \
+  --user nbv \
+  --skip-packages
+```
+
+## Filament assety
+
+Skript po inštalácii Filamentu automaticky spustí:
+
+```bash
+php artisan filament:assets
+```
+
+Potom overí, že skutočne existujú aspoň tieto súbory:
+
+- `public/css/filament/filament/app.css`
+- `public/js/filament/filament/app.js`
+
+Ak sa po prvom publishi nenájdu, skript publish skúsi ešte raz. Ak stále chýbajú, deploy skončí chybou, aby si nedostal rozbitý login bez štýlov.
+
+## SSL správanie
+
+Skript vie hľadať SSL súbory v týchto cestách:
+
+- `/home/<user>/ssl.combined` + `/home/<user>/ssl.key`
+- `/home/<user>/ssl.cert` + `/home/<user>/ssl.key`
+- `/etc/letsencrypt/live/<domain>/fullchain.pem` + `/etc/letsencrypt/live/<domain>/privkey.pem`
+- fallback aj cez `/etc/letsencrypt/archive/<domain>/`
+
+Ak sa SSL súbory nájdu, skript pripraví HTTPS Nginx blok automaticky.  
+Ak sa nenájdu, pripraví HTTP-only konfiguráciu a po vystavení certifikátu stačí skript spustiť znova bez resetu.
+
+## Výstup po úspechu
+
+Po úspešnom behu skript vypíše:
+
+- URL admin loginu
+- email a heslo admin používateľa
+- PostgreSQL meno databázy, používateľa a heslo
+- cestu k root-only súboru s prihlasovacími údajmi
+
+Príklad:
 
 ```text
-/home/<user>/laravel-app
+Hotovo. Ďalšie kroky:
+1) Skontroluj web: https://nbv.sk/admin/login
+2) Prihlasovacie údaje admin používateľa:
+   Email: admin@nbv.sk
+   Heslo: ...
+3) Databázové údaje:
+   DB name: nbv_matrika
+   DB user: nbv_matrika_user
+   DB pass: ...
+4) Uložené aj do root súboru: /root/nbv.sk-deploy-credentials-YYYYMMDD-HHMMSS.txt
 ```
 
-### Webroot
+## Kam sa ukladajú vygenerované heslá
 
-Skript patchuje Nginx tak, aby root smeroval na:
+Skript vytvorí root-only súbor v tvare:
 
 ```text
-/home/<user>/laravel-app/public
+/root/<domain>-deploy-credentials-<timestamp>.txt
 ```
 
-### PostgreSQL
+Práva sú nastavené na `600`.
 
-Vytvorí:
+## Poznámky
 
-- DB používateľa
-- databázu
-- granty
+- Pri deployi sa môžu objaviť warningy typu `Migration already exists.` pre voliteľné queue migrácie. To je akceptované a deploy tým nekončí.
+- Ak Nginx vypíše warning typu `listen ... http2 directive is deprecated`, ide o nefatálne upozornenie.
+- Koreňová route `/` nemusí byť definovaná. Dôležitý test po deployi je `https://<domain>/admin/login`.
 
-### Laravel `.env`
-
-Nastaví najmä:
-
-- `APP_ENV=production`
-- `APP_DEBUG=false`
-- `APP_URL=https://<domain>`
-- `DB_CONNECTION=pgsql`
-- `SESSION_DRIVER=file`
-- `CACHE_STORE=file`
-- `QUEUE_CONNECTION=database`
-
-### Filament opravy
-
-Skript pridá / opraví:
-
-- `AdminPanelProvider.php`
-- `User.php` s `FilamentUser` a `canAccessPanel()`
-
-To rieši aj častý problém:
-
-- `403 Forbidden` po prihlásení do Filamentu
-
----
-
-## Čo spraviť po dobehnutí skriptu
-
-### 1. vytvoriť Filament admin používateľa
+## Kontrola po deployi
 
 ```bash
-su - fema
-cd /home/fema/laravel-app
-php artisan make:filament-user
+openssl s_client -connect nbv.sk:443 -servername nbv.sk </dev/null 2>/dev/null | openssl x509 -noout -subject -issuer -ext subjectAltName
 ```
 
-### 2. overiť admin login
+Ak je všetko správne, medzi SAN záznamami uvidíš:
 
-```text
-https://fema.sk/admin/login
-```
+- `DNS:nbv.sk`
+- `DNS:www.nbv.sk`
 
-### 3. ak ešte nie je SSL
-vystaviť ho cez Virtualmin samostatne
+## Git workflow
 
----
+Odporúčaný názov skriptov v repozitári nechaj stabilný:
 
-## Dôležité upozornenia
+- `scripts/setup-laravel-virtualmin.sh`
+- `scripts/reset-laravel-virtualmin.sh`
 
-### 1. Virtualmin môže config neskôr prepísať
-Skript síce upraví Nginx config správne pre Laravel, ale ak neskôr Virtualmin vygeneruje config znovu, môže časť zmien prepísať.
+Verzie sleduj cez:
 
-Preto je dobré:
+- commity
+- tagy
+- GitHub Releases
 
-- otestovať skript na starej / testovacej doméne
-- po finálnom nastavení si skontrolovať `fema.sk.conf`
+Nie cez názvy typu `-v4`, `-v5`, `-final-final`.
 
-### 2. Nie je to skript na opravu úplne rozbitého prostredia
-Najlepšie funguje na:
+## Licencia
 
-- novej doméne
-- čistej inštalácii
-- alebo aspoň na prehľadnom testovacom serveri
-
-### 3. Filament admin používateľa nerobí automaticky
-Je to zámer. Heslo admina sa lepšie zadáva ručne.
-
----
-
-## Rýchla kontrola po inštalácii
-
-Ako používateľ domény:
-
-```bash
-su - fema
-cd /home/fema/laravel-app
-php artisan about
-php artisan route:list | grep admin
-```
-
-Ako root:
-
-```bash
-nginx -t
-systemctl status nginx
-systemctl status php8.4-fpm
-systemctl status postgresql
-systemctl status supervisor
-```
-
----
-
-## Typické problémy
-
-### 404 na `/admin/login`
-Najčastejšie zle nastavený Nginx root alebo chýbajúce `try_files`.
-
-### 500 Server Error
-Pozrieť:
-
-```bash
-tail -f /var/log/virtualmin/<domena>_error_log
-su - <user>
-cd /home/<user>/laravel-app
-tail -f storage/logs/laravel.log
-```
-
-### 403 po prihlásení
-Zvyčajne chýba správne upravený `User.php`.
-Tento skript to rieši automaticky.
-
-### Filament panel nejde
-Skontrolovať:
-
-- `bootstrap/providers.php`
-- `app/Providers/Filament/AdminPanelProvider.php`
-- `php artisan optimize:clear`
-
----
-
-## Odporúčanie na test
-Pred ostrým použitím:
-
-- spusti skript na starej VPS alebo testovacej doméne
-- ideálne s `--dry-run
-- `--skip-cert-check` preskočí záverečný test HTTPS certifikátu`
-- potom ostrá doména
-
----
-
-## Súvisiace ručné príkazy po úspešnom nasadení
-
-```bash
-su - <user>
-cd /home/<user>/laravel-app
-php artisan make:filament-user
-php artisan optimize
-```
-
----
-
-## Stručné zhrnutie
-
-Tento skript je vhodný na:
-
-- novú Laravel + Filament inštaláciu
-- existujúcu Virtualmin doménu
-- PostgreSQL
-- Nginx
-- nasadenie s korektným `su - <user>` workflow
-
-Na ostrý produkčný server je najlepšie ho najprv preveriť na testovacej doméne.
+Použi podľa potreby v rámci vlastnej infraštruktúry.

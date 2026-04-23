@@ -8,17 +8,23 @@ Parametrický setup skript pre Laravel + Filament + PostgreSQL na existujúcej V
 Použitie:
   sudo bash setup-laravel-virtualmin.sh \
     --domain fema.sk \
-    --user fema \
-    --db-pass 'SILNE_HESLO'
+    --user fema
 
 Voliteľné:
   --db-name NAME            default: <user>_matrika
   --db-user NAME            default: <user>_matrika_user
+  --db-pass PASS            ak chýba, skript vygeneruje silné heslo
   --app-dir PATH            default: /home/<user>/laravel-app
   --php-version VERSION     default: 8.4
   --skip-packages           preskočí apt install
   --skip-cert-check         preskočí kontrolu HTTPS certifikátu na konci
   --dry-run                 iba vypíše kroky, nič nemení
+
+Admin používateľ:
+  --no-admin                nevytvorí prvého Filament admin používateľa
+  --admin-name NAME         default: Administrator
+  --admin-email EMAIL       default: admin@<domain>
+  --admin-pass PASS         ak chýba, skript vygeneruje silné heslo
 
 Reset pred deployom:
   --reset-first             zmaže starý Laravel pokus pred novým deployom
@@ -31,8 +37,8 @@ Reset pred deployom:
 Poznámky:
 - Skript predpokladá, že Virtualmin doména už existuje.
 - Aplikačné kroky bežia vždy cez: su - <user>
-- Nerieši DNS ani vystavenie SSL certifikátu.
-- Vytvorenie Filament admin používateľa necháva na konci ako ručný krok.
+- Vie vytvoriť alebo opraviť prázdny Nginx config pre Laravel.
+- Vygenerované heslá vypíše na konci a uloží do /root ako root-only súbor.
 USAGE
 }
 
@@ -55,6 +61,17 @@ RESET_FIRST=0
 RESET_DROP_DB=0
 RESET_DROP_ROLE=0
 RESET_YES=0
+CREATE_ADMIN=1
+ADMIN_NAME=""
+ADMIN_EMAIL=""
+ADMIN_PASS=""
+GENERATED_DB_PASS=0
+GENERATED_ADMIN_PASS=0
+APP_SCHEME="https"
+HAS_SSL=0
+SSL_CERT_PATH=""
+SSL_KEY_PATH=""
+CREDENTIALS_FILE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -72,13 +89,17 @@ while [[ $# -gt 0 ]]; do
     --reset-drop-db) RESET_DROP_DB=1; shift ;;
     --reset-drop-role) RESET_DROP_ROLE=1; shift ;;
     --reset-yes) RESET_YES=1; shift ;;
+    --no-admin) CREATE_ADMIN=0; shift ;;
+    --admin-name) ADMIN_NAME="$2"; shift 2 ;;
+    --admin-email) ADMIN_EMAIL="$2"; shift 2 ;;
+    --admin-pass) ADMIN_PASS="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
   esac
 done
 
 [[ $EUID -eq 0 ]] || { echo "Skript spusti ako root." >&2; exit 1; }
-[[ -n "$DOMAIN" && -n "$DOMAIN_USER" && -n "$DB_PASS" ]] || { usage; exit 1; }
+[[ -n "$DOMAIN" && -n "$DOMAIN_USER" ]] || { usage; exit 1; }
 
 DB_NAME="${DB_NAME:-${DOMAIN_USER}_matrika}"
 DB_USER="${DB_USER:-${DOMAIN_USER}_matrika_user}"
@@ -91,6 +112,10 @@ TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 PHP_FPM_SERVICE="php${PHP_VERSION}-fpm"
 CRONLINE="* * * * * cd ${APP_DIR} && php artisan schedule:run >> /dev/null 2>&1"
 SUPERVISOR_CONF="/etc/supervisor/conf.d/${DOMAIN_USER}-laravel-worker.conf"
+
+ADMIN_NAME="${ADMIN_NAME:-Administrator}"
+ADMIN_EMAIL="${ADMIN_EMAIL:-admin@${DOMAIN}}"
+CREDENTIALS_FILE="/root/${DOMAIN}-deploy-credentials-${TIMESTAMP}.txt"
 
 log() { echo "[INFO] $*"; }
 warn() { echo "[WARN] $*" >&2; }
@@ -169,6 +194,11 @@ validate_pg_identifier() {
   [[ "$value" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || die "${label}='${value}' nie je bezpečný PostgreSQL identifikátor. Použi len písmená, čísla a _ ; začiatok musí byť písmeno alebo _."
 }
 
+validate_email() {
+  local value="$1"
+  [[ "$value" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die "Admin email '${value}' nemá platný formát."
+}
+
 sql_escape_literal() {
   printf "%s" "$1" | sed "s/'/''/g"
 }
@@ -179,6 +209,55 @@ dotenv_escape() {
   value="${value//\"/\\\"}"
   value="${value//\$/\\$}"
   printf '"%s"' "$value"
+}
+
+generate_password() {
+  python3 - <<'PY'
+import secrets
+import string
+alphabet = string.ascii_letters + string.digits + "_-@%+="
+print(''.join(secrets.choice(alphabet) for _ in range(24)))
+PY
+}
+
+b64() {
+  printf "%s" "$1" | base64 | tr -d '\n'
+}
+
+determine_ssl_paths() {
+  local base="/home/${DOMAIN_USER}"
+  HAS_SSL=0
+  SSL_CERT_PATH=""
+  SSL_KEY_PATH=""
+
+  if [[ -s "${base}/ssl.combined" && -s "${base}/ssl.key" ]]; then
+    HAS_SSL=1
+    SSL_CERT_PATH="${base}/ssl.combined"
+    SSL_KEY_PATH="${base}/ssl.key"
+  elif [[ -s "${base}/ssl.cert" && -s "${base}/ssl.key" ]]; then
+    HAS_SSL=1
+    SSL_CERT_PATH="${base}/ssl.cert"
+    SSL_KEY_PATH="${base}/ssl.key"
+  elif [[ -s "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" && -s "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" ]]; then
+    HAS_SSL=1
+    SSL_CERT_PATH="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
+    SSL_KEY_PATH="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
+  elif [[ -d "/etc/letsencrypt/archive/${DOMAIN}" ]]; then
+    local latest_fullchain latest_privkey
+    latest_fullchain="$(ls -1 /etc/letsencrypt/archive/${DOMAIN}/fullchain*.pem 2>/dev/null | sort -V | tail -n 1 || true)"
+    latest_privkey="$(ls -1 /etc/letsencrypt/archive/${DOMAIN}/privkey*.pem 2>/dev/null | sort -V | tail -n 1 || true)"
+    if [[ -n "${latest_fullchain}" && -n "${latest_privkey}" && -s "${latest_fullchain}" && -s "${latest_privkey}" ]]; then
+      HAS_SSL=1
+      SSL_CERT_PATH="${latest_fullchain}"
+      SSL_KEY_PATH="${latest_privkey}"
+    fi
+  fi
+
+  if [[ $HAS_SSL -eq 1 ]]; then
+    APP_SCHEME="https"
+  else
+    APP_SCHEME="http"
+  fi
 }
 
 print_versions() {
@@ -196,12 +275,14 @@ print_versions() {
 basic_precheck() {
   log "Spúšťam základný precheck..."
   require_dir "/home/${DOMAIN_USER}"
-  require_file "$NGINX_CONF"
   id "$DOMAIN_USER" >/dev/null 2>&1 || die "Používateľ ${DOMAIN_USER} neexistuje."
   validate_pg_identifier "$DB_NAME" "DB_NAME"
   validate_pg_identifier "$DB_USER" "DB_USER"
   command_exists apt || die "Chýba apt."
   command_exists systemctl || die "Chýba systemctl."
+  if [[ $CREATE_ADMIN -eq 1 ]]; then
+    validate_email "$ADMIN_EMAIL"
+  fi
   log "Základný precheck prešiel úspešne."
 }
 
@@ -209,7 +290,7 @@ full_precheck() {
   log "Spúšťam plný precheck prostredia..."
   local failed=0
 
-  for cmd in php composer node npm psql nginx python3; do
+  for cmd in php composer node npm psql nginx python3 base64; do
     if ! command_exists "$cmd"; then
       warn "Chýba príkaz: $cmd"
       failed=1
@@ -242,8 +323,15 @@ full_precheck() {
     fi
   fi
 
+  determine_ssl_paths
+
   log "Základné verzie:"
   print_versions || true
+  if [[ $HAS_SSL -eq 1 ]]; then
+    log "Našiel som SSL súbory pre web: cert=${SSL_CERT_PATH}, key=${SSL_KEY_PATH}"
+  else
+    warn "SSL súbory pre ${DOMAIN} sa nenašli v /home/${DOMAIN_USER} ani v Let\'s Encrypt cestách. Vytvorím HTTP-only alebo fallback Nginx config."
+  fi
 
   [[ $failed -eq 0 ]] || die "Plný precheck zlyhal. Doinštaluj alebo oprav chýbajúce komponenty a skús skript znova."
   log "Plný precheck prešiel úspešne."
@@ -257,6 +345,11 @@ check_cert() {
 
   if [[ $DRY_RUN -eq 1 ]]; then
     echo "+ check DNS and HTTPS certificate for ${DOMAIN}"
+    return 0
+  fi
+
+  if [[ $HAS_SSL -eq 0 ]]; then
+    warn "Kontrola certifikátu sa preskakuje, lebo SSL súbory pre ${DOMAIN} zatiaľ nie sú pripravené."
     return 0
   fi
 
@@ -390,7 +483,216 @@ ensure_migration() {
   fi
 }
 
+write_default_nginx_conf() {
+  if [[ $HAS_SSL -eq 1 ]]; then
+    write_file "$NGINX_CONF" <<EOF_NGX
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN} www.${DOMAIN};
+
+    location ^~ /.well-known/ {
+        root ${APP_PUBLIC_DIR};
+        try_files \$uri /;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name ${DOMAIN} www.${DOMAIN};
+    root ${APP_PUBLIC_DIR};
+    index index.php index.html;
+
+    ssl_certificate ${SSL_CERT_PATH};
+    ssl_certificate_key ${SSL_KEY_PATH};
+
+    location ^~ /.well-known/ {
+        try_files \$uri /;
+    }
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \.php$ {
+        include fastcgi_params;
+        fastcgi_pass unix:/run/php/php${PHP_VERSION}-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME ${APP_PUBLIC_DIR}\$fastcgi_script_name;
+        fastcgi_param DOCUMENT_ROOT ${APP_PUBLIC_DIR};
+    }
+}
+EOF_NGX
+  else
+    write_file "$NGINX_CONF" <<EOF_NGX
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN} www.${DOMAIN};
+    root ${APP_PUBLIC_DIR};
+    index index.php index.html;
+
+    location ^~ /.well-known/ {
+        try_files \$uri /;
+    }
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \.php$ {
+        include fastcgi_params;
+        fastcgi_pass unix:/run/php/php${PHP_VERSION}-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME ${APP_PUBLIC_DIR}\$fastcgi_script_name;
+        fastcgi_param DOCUMENT_ROOT ${APP_PUBLIC_DIR};
+    }
+}
+EOF_NGX
+  fi
+}
+
+ensure_nginx_conf() {
+  determine_ssl_paths
+
+  if [[ ! -f "$NGINX_CONF" || ! -s "$NGINX_CONF" ]]; then
+    log "Nginx config ${NGINX_CONF} chýba alebo je prázdny, vytváram nový."
+    write_default_nginx_conf
+    return 0
+  fi
+
+  if ! grep -q "server_name" "$NGINX_CONF"; then
+    warn "Nginx config ${NGINX_CONF} neobsahuje server_name, prepíšem ho fallback šablónou."
+    run "cp '${NGINX_CONF}' '${NGINX_CONF}.bak.${TIMESTAMP}' || true"
+    write_default_nginx_conf
+    return 0
+  fi
+
+  run "cp '${NGINX_CONF}' '${NGINX_CONF}.bak.${TIMESTAMP}'"
+  write_default_nginx_conf
+}
+
+ensure_filament_assets() {
+  local css_path="${APP_DIR}/public/css/filament/filament/app.css"
+  local js_path="${APP_DIR}/public/js/filament/filament/app.js"
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "+ su - ${DOMAIN_USER} -c $(printf '%q' "cd '${APP_DIR}' && php artisan filament:assets")"
+    echo "+ verify filament assets: ${css_path} ${js_path}"
+    return 0
+  fi
+
+  run_user "cd '${APP_DIR}' && php artisan filament:assets"
+
+  if [[ ! -s "${css_path}" || ! -s "${js_path}" ]]; then
+    warn "Filament assety sa po prvom publish nenašli, skúšam publish ešte raz."
+    run_user "cd '${APP_DIR}' && php artisan filament:assets"
+  fi
+
+  [[ -s "${css_path}" ]] || die "Chýba Filament CSS asset: ${css_path}"
+  [[ -s "${js_path}" ]] || die "Chýba Filament JS asset: ${js_path}"
+}
+
+create_or_update_admin_user() {
+  [[ $CREATE_ADMIN -eq 1 ]] || return 0
+
+  local name_b64 email_b64 pass_b64
+  name_b64="$(b64 "$ADMIN_NAME")"
+  email_b64="$(b64 "$ADMIN_EMAIL")"
+  pass_b64="$(b64 "$ADMIN_PASS")"
+
+  run_user "cd '${APP_DIR}' && php -r 'require \"vendor/autoload.php\"; \$app=require_once \"bootstrap/app.php\"; \$kernel=\$app->make(Illuminate\\Contracts\\Console\\Kernel::class); \$kernel->bootstrap(); \$name=base64_decode(\"${name_b64}\"); \$email=base64_decode(\"${email_b64}\"); \$pass=base64_decode(\"${pass_b64}\"); \\App\\Models\\User::updateOrCreate([\"email\"=>\$email],[\"name\"=>\$name,\"password\"=>\$pass]); echo \"Admin user ready: {\$email}\n\";'"
+}
+
+write_credentials_file() {
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "+ write credentials file ${CREDENTIALS_FILE}"
+    return 0
+  fi
+
+  umask 077
+  cat >"${CREDENTIALS_FILE}" <<EOF_CREDS
+Laravel deploy credentials
+=========================
+Date: ${TIMESTAMP}
+Domain: ${DOMAIN}
+App dir: ${APP_DIR}
+App URL: ${APP_SCHEME}://${DOMAIN}
+
+Database
+--------
+DB name: ${DB_NAME}
+DB user: ${DB_USER}
+DB pass: ${DB_PASS}
+
+Admin
+-----
+Create admin: ${CREATE_ADMIN}
+Admin name: ${ADMIN_NAME}
+Admin email: ${ADMIN_EMAIL}
+Admin pass: ${ADMIN_PASS}
+
+Notes
+-----
+- Tento súbor je určený len pre root.
+- Heslá si bezpečne ulož.
+- Po prvom prihlásení odporúčam heslá zmeniť.
+EOF_CREDS
+  chmod 600 "${CREDENTIALS_FILE}"
+}
+
+print_summary() {
+  echo
+  echo "Hotovo. Ďalšie kroky:"
+  echo "1) Skontroluj web: ${APP_SCHEME}://${DOMAIN}/admin/login"
+  if [[ $CREATE_ADMIN -eq 1 ]]; then
+    echo "2) Prihlasovacie údaje admin používateľa:"
+    echo "   Email: ${ADMIN_EMAIL}"
+    echo "   Heslo: ${ADMIN_PASS}"
+  else
+    echo "2) Ak chceš admin používateľa vytvoriť ručne:"
+    echo "   su - ${DOMAIN_USER}"
+    echo "   cd ${APP_DIR}"
+    echo "   php artisan make:filament-user"
+  fi
+  echo "3) Databázové údaje:"
+  echo "   DB name: ${DB_NAME}"
+  echo "   DB user: ${DB_USER}"
+  echo "   DB pass: ${DB_PASS}"
+  if [[ $DRY_RUN -eq 0 ]]; then
+    echo "4) Uložené aj do root súboru: ${CREDENTIALS_FILE}"
+  else
+    echo "4) V dry-run režime sa prihlasovacie údaje len simulujú a do súboru sa neukladajú."
+  fi
+  echo "5) Heslá si bezpečne ulož alebo po prvom prihlásení zmeň."
+  if [[ $HAS_SSL -eq 0 ]]; then
+    echo "6) SSL súbory sa nenašli, Nginx bol pripravený bez HTTPS. Po vystavení certifikátu skript spusti znova."
+  fi
+}
+
 basic_precheck
+
+if [[ -z "$DB_PASS" ]]; then
+  if [[ $DRY_RUN -eq 1 ]]; then
+    DB_PASS="GENERATED_DB_PASSWORD_AT_RUNTIME"
+  else
+    DB_PASS="$(generate_password)"
+    GENERATED_DB_PASS=1
+  fi
+fi
+
+if [[ $CREATE_ADMIN -eq 1 && -z "$ADMIN_PASS" ]]; then
+  if [[ $DRY_RUN -eq 1 ]]; then
+    ADMIN_PASS="GENERATED_ADMIN_PASSWORD_AT_RUNTIME"
+  else
+    ADMIN_PASS="$(generate_password)"
+    GENERATED_ADMIN_PASS=1
+  fi
+fi
 
 if [[ $SKIP_PACKAGES -eq 0 ]]; then
   log "Doinštalujem/overím požadované balíky..."
@@ -425,7 +727,7 @@ APP_NAME=${DOMAIN_USER^^}
 APP_ENV=production
 APP_KEY=${APP_KEY_CURRENT}
 APP_DEBUG=false
-APP_URL=https://${DOMAIN}
+APP_URL=${APP_SCHEME}://${DOMAIN}
 
 APP_LOCALE=en
 APP_FALLBACK_LOCALE=en
@@ -649,62 +951,15 @@ fi
 run_user "cd '${APP_DIR}' && php artisan key:generate --force"
 run_user "cd '${APP_DIR}' && php artisan storage:link || true"
 run_user "cd '${APP_DIR}' && php artisan migrate --force"
+create_or_update_admin_user
 run_user "cd '${APP_DIR}' && npm install"
 run_user "cd '${APP_DIR}' && npm run build"
+ensure_filament_assets
 run_user "cd '${APP_DIR}' && composer dump-autoload -o --no-interaction"
 run_user "cd '${APP_DIR}' && php artisan optimize:clear"
 run_user "cd '${APP_DIR}' && php artisan optimize"
 
-require_file "$NGINX_CONF"
-run "cp '${NGINX_CONF}' '${NGINX_CONF}.bak.${TIMESTAMP}'"
-
-export DOMAIN APP_PUBLIC_DIR NGINX_CONF
-if [[ $DRY_RUN -eq 0 ]]; then
-  python3 - <<'PY'
-import os
-import re
-from pathlib import Path
-
-conf = Path(os.environ["NGINX_CONF"])
-text = conf.read_text()
-
-domain = os.environ["DOMAIN"]
-app_public = os.environ["APP_PUBLIC_DIR"]
-
-text = re.sub(r"server_name\s+[^;]+;", f"server_name {domain} www.{domain};", text, count=1)
-text = re.sub(r"root\s+[^;]+;", f"root {app_public};", text, count=1)
-text = re.sub(
-    r'fastcgi_param\s+SCRIPT_FILENAME\s+"[^"]+\$fastcgi_script_name";',
-    f'fastcgi_param SCRIPT_FILENAME "{app_public}\\$fastcgi_script_name";',
-    text,
-    count=1,
-)
-text = re.sub(
-    r"fastcgi_param\s+DOCUMENT_ROOT\s+[^;]+;",
-    f"fastcgi_param DOCUMENT_ROOT {app_public};",
-    text,
-    count=1,
-)
-
-text = re.sub(r"\n\s*if \(\$host = webmail\.[^\n]+\{[\s\S]*?\n\s*\}", "", text, count=1)
-text = re.sub(r"\n\s*if \(\$host = admin\.[^\n]+\{[\s\S]*?\n\s*\}", "", text, count=1)
-
-if 'location / {' not in text:
-    replacement = "location ^~ /.well-known/ {\n\t\ttry_files $uri /;\n\t}\n\tlocation / {\n\t\ttry_files $uri $uri/ /index.php?$query_string;\n\t}"
-    text = text.replace("location ^~ /.well-known/ {\n\t\ttry_files $uri /;\n\t}", replacement, 1)
-else:
-    text = re.sub(
-        r"location / \{[\s\S]*?\}",
-        "location / {\n\t\ttry_files $uri $uri/ /index.php?$query_string;\n\t}",
-        text,
-        count=1,
-    )
-
-conf.write_text(text)
-PY
-else
-  echo "+ update nginx config ${NGINX_CONF} for Laravel root ${APP_PUBLIC_DIR}"
-fi
+ensure_nginx_conf
 
 if [[ ! -L "$NGINX_ENABLED" ]]; then
   run "rm -f '${NGINX_ENABLED}'"
@@ -737,16 +992,9 @@ run "supervisorctl reread"
 run "supervisorctl update"
 run "supervisorctl restart ${DOMAIN_USER}-laravel-worker:* || supervisorctl start ${DOMAIN_USER}-laravel-worker:*"
 
+write_credentials_file
+
 run_user "cd '${APP_DIR}' && php artisan about"
 run_user "cd '${APP_DIR}' && php artisan route:list | grep admin || true"
 check_cert
-
-echo
-
-echo "Hotovo. Ďalšie kroky:"
-echo "1) Skontroluj web: https://${DOMAIN}/admin/login"
-echo "2) Vytvor Filament admin usera ako ${DOMAIN_USER}:"
-echo "   su - ${DOMAIN_USER}"
-echo "   cd ${APP_DIR}"
-echo "   php artisan make:filament-user"
-echo "3) Ak treba, vystav/obnov SSL vo Virtualmine pre ${DOMAIN} a www.${DOMAIN}."
+print_summary
