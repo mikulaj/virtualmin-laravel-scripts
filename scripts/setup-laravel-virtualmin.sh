@@ -641,7 +641,7 @@ fi
 if [[ $DRY_RUN -eq 0 ]]; then
   ensure_migration "create_jobs_table" "php artisan make:queue-table" 1
   ensure_migration "create_job_batches_table" "php artisan make:queue-batches-table" 0
-  ensure_migration "create_failed_jobs_table" "php artisan make:queue-failed-table" 1
+  ensure_migration "create_failed_jobs_table" "php artisan make:queue-failed-table" 0
 else
   echo "+ ensure queue migration files exist"
 fi
