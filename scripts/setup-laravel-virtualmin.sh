@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 usage() {
-  cat <<'USAGE'
+  cat <<'EOH'
 Parametrický setup skript pre Laravel + Filament + PostgreSQL na existujúcej Virtualmin doméne.
 
 Použitie:
@@ -19,6 +19,13 @@ Voliteľné:
   --skip-packages           preskočí apt install
   --skip-cert-check         preskočí kontrolu HTTPS certifikátu na konci
   --dry-run                 iba vypíše kroky, nič nemení
+
+Reset pred deployom:
+  --reset-first             pred deployom zmaže existujúci Laravel projekt, cron a supervisor worker
+  --reset-drop-db           pri --reset-first zmaže aj PostgreSQL databázu
+  --reset-drop-role         pri --reset-first zmaže aj PostgreSQL rolu/usera (vyžaduje --reset-drop-db)
+  --reset-yes               pri --reset-first nežiada potvrdenie
+
   -h, --help                zobrazí túto nápovedu
 
 Poznámky:
@@ -26,7 +33,7 @@ Poznámky:
 - Aplikačné kroky bežia vždy cez: su - <user>
 - Nerieši DNS ani vystavenie SSL certifikátu.
 - Vytvorenie Filament admin používateľa necháva na konci ako ručný krok.
-USAGE
+EOH
 }
 
 if [[ $# -eq 0 ]]; then
@@ -44,6 +51,10 @@ PHP_VERSION="8.4"
 SKIP_PACKAGES=0
 SKIP_CERT_CHECK=0
 DRY_RUN=0
+RESET_FIRST=0
+RESET_DROP_DB=0
+RESET_DROP_ROLE=0
+RESET_ASSUME_YES=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -57,6 +68,10 @@ while [[ $# -gt 0 ]]; do
     --skip-packages) SKIP_PACKAGES=1; shift ;;
     --skip-cert-check) SKIP_CERT_CHECK=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
+    --reset-first) RESET_FIRST=1; shift ;;
+    --reset-drop-db) RESET_DROP_DB=1; shift ;;
+    --reset-drop-role) RESET_DROP_ROLE=1; shift ;;
+    --reset-yes) RESET_ASSUME_YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
   esac
@@ -64,6 +79,7 @@ done
 
 [[ $EUID -eq 0 ]] || { echo "Skript spusti ako root." >&2; exit 1; }
 [[ -n "$DOMAIN" && -n "$DOMAIN_USER" && -n "$DB_PASS" ]] || { usage; exit 1; }
+[[ $RESET_DROP_ROLE -eq 0 || $RESET_DROP_DB -eq 1 ]] || { echo "--reset-drop-role vyžaduje aj --reset-drop-db" >&2; exit 1; }
 
 DB_NAME="${DB_NAME:-${DOMAIN_USER}_matrika}"
 DB_USER="${DB_USER:-${DOMAIN_USER}_matrika_user}"
@@ -74,8 +90,8 @@ NGINX_ENABLED="/etc/nginx/sites-enabled/${DOMAIN}.conf"
 BOOTSTRAP_PROVIDERS="${APP_DIR}/bootstrap/providers.php"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 PHP_FPM_SERVICE="php${PHP_VERSION}-fpm"
-DB_PASS_SQL=""
-DB_PASS_ENV=""
+SUPERVISOR_CONF="/etc/supervisor/conf.d/${DOMAIN_USER}-laravel-worker.conf"
+CRONLINE="* * * * * cd ${APP_DIR} && php artisan schedule:run >> /dev/null 2>&1"
 
 log() { echo "[INFO] $*"; }
 warn() { echo "[WARN] $*" >&2; }
@@ -101,43 +117,17 @@ run_user() {
   fi
 }
 
-run_postgres_sql() {
-  local sql="$1"
-  if [[ $DRY_RUN -eq 1 ]]; then
-    echo "+ su - postgres -c psql -v ON_ERROR_STOP=1 -c $(printf '%q' "$sql")"
-  else
-    su - postgres -c "psql -v ON_ERROR_STOP=1 -c $(printf '%q' "$sql")"
-  fi
-}
-
-postgres_query() {
-  local sql="$1"
-  su - postgres -c "psql -v ON_ERROR_STOP=1 -tAc $(printf '%q' "$sql")"
-}
-
-print_versions() {
-  command_exists php && php -v | head -1 || true
-  command_exists composer && composer --version || true
-  command_exists node && node -v || true
-  command_exists npm && npm -v || true
-  command_exists psql && psql --version || true
-  command_exists nginx && nginx -v 2>&1 || true
-  command_exists python3 && python3 --version || true
-}
-
-validate_identifier() {
-  local label="$1"
-  local value="$2"
-
-  [[ "$value" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "${label} má neplatný formát: ${value}. Povolené sú len písmená, čísla a _; prvý znak musí byť písmeno alebo _."
-  [[ ${#value} -le 63 ]] || die "${label} je príliš dlhý pre PostgreSQL (max 63 znakov): ${value}"
+validate_pg_identifier() {
+  local value="$1"
+  local label="$2"
+  [[ "$value" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || die "${label}='${value}' nie je bezpečný PostgreSQL identifikátor. Použi len písmená, čísla a _ ; začiatok musí byť písmeno alebo _."
 }
 
 sql_escape_literal() {
   printf "%s" "$1" | sed "s/'/''/g"
 }
 
-dotenv_escape_double_quoted() {
+dotenv_escape() {
   local value="$1"
   value="${value//\\/\\\\}"
   value="${value//\"/\\\"}"
@@ -145,9 +135,14 @@ dotenv_escape_double_quoted() {
   printf '"%s"' "$value"
 }
 
-prepare_escaped_values() {
-  DB_PASS_SQL="$(sql_escape_literal "$DB_PASS")"
-  DB_PASS_ENV="$(dotenv_escape_double_quoted "$DB_PASS")"
+print_versions() {
+  command_exists php && php -v | head -1 || true
+  command_exists composer && run_user "composer --version --no-interaction" || true
+  command_exists node && node -v || true
+  command_exists npm && npm -v || true
+  command_exists psql && psql --version || true
+  command_exists nginx && nginx -v 2>&1 || true
+  command_exists python3 && python3 --version || true
 }
 
 basic_precheck() {
@@ -155,37 +150,18 @@ basic_precheck() {
   require_dir "/home/${DOMAIN_USER}"
   require_file "$NGINX_CONF"
   id "$DOMAIN_USER" >/dev/null 2>&1 || die "Používateľ ${DOMAIN_USER} neexistuje."
-
-  if [[ $SKIP_PACKAGES -eq 0 ]]; then
-    command_exists apt-get || die "Na serveri chýba apt-get."
-  fi
-
-  validate_identifier "DB_NAME" "$DB_NAME"
-  validate_identifier "DB_USER" "$DB_USER"
-  prepare_escaped_values
-
+  validate_pg_identifier "$DB_NAME" "DB_NAME"
+  validate_pg_identifier "$DB_USER" "DB_USER"
+  command_exists apt || die "Chýba apt."
+  command_exists systemctl || die "Chýba systemctl."
   log "Základný precheck prešiel úspešne."
-}
-
-install_packages() {
-  if [[ $SKIP_PACKAGES -eq 1 ]]; then
-    warn "Preskakujem inštaláciu balíkov (--skip-packages)."
-    return 0
-  fi
-
-  log "Doinštalujem/overím požadované balíky..."
-  run "apt update"
-  run "DEBIAN_FRONTEND=noninteractive apt install -y git unzip curl ca-certificates openssl python3 composer postgresql postgresql-client nginx nodejs npm redis-server supervisor php${PHP_VERSION}-cli php${PHP_VERSION}-fpm php${PHP_VERSION}-pgsql php${PHP_VERSION}-mbstring php${PHP_VERSION}-xml php${PHP_VERSION}-curl php${PHP_VERSION}-zip php${PHP_VERSION}-bcmath php${PHP_VERSION}-intl php${PHP_VERSION}-gd php${PHP_VERSION}-redis"
-  run "systemctl enable --now postgresql redis-server supervisor ${PHP_FPM_SERVICE} nginx"
 }
 
 full_precheck() {
   log "Spúšťam plný precheck prostredia..."
-
   local failed=0
-  local required_commands=(php composer node npm psql nginx python3 openssl)
 
-  for cmd in "${required_commands[@]}"; do
+  for cmd in php composer node npm psql nginx python3; do
     if ! command_exists "$cmd"; then
       warn "Chýba príkaz: $cmd"
       failed=1
@@ -204,11 +180,19 @@ full_precheck() {
     warn "Služba nginx nebeží."
     failed=1
   fi
+  if ! systemctl is-active --quiet redis-server; then
+    warn "Služba redis-server nebeží."
+    failed=1
+  fi
+  if ! systemctl is-active --quiet supervisor; then
+    warn "Služba supervisor nebeží."
+    failed=1
+  fi
 
   if command_exists php; then
     local phpmods
     phpmods="$(php -m | tr '[:upper:]' '[:lower:]')"
-    local required_modules=(bcmath curl gd intl mbstring pdo_pgsql pgsql xml xmlreader xmlwriter zip)
+    local required_modules=(bcmath curl gd intl mbstring pdo_pgsql pgsql xml xmlreader xmlwriter zip redis)
     for mod in "${required_modules[@]}"; do
       if ! grep -qx "$mod" <<<"$phpmods"; then
         warn "Chýba PHP modul: $mod"
@@ -218,7 +202,7 @@ full_precheck() {
   fi
 
   if systemctl is-active --quiet postgresql; then
-    if ! postgres_query "SELECT 1" >/dev/null 2>&1; then
+    if ! sudo -u postgres psql -tAc "SELECT 1" >/dev/null 2>&1; then
       warn "Nepodarilo sa otestovať PostgreSQL cez postgres používateľa."
       failed=1
     fi
@@ -227,34 +211,8 @@ full_precheck() {
   log "Základné verzie:"
   print_versions || true
 
-  [[ $failed -eq 0 ]] || die "Precheck zlyhal. Doinštaluj alebo oprav chýbajúce komponenty a skús skript znova."
+  [[ $failed -eq 0 ]] || die "Plný precheck zlyhal. Doinštaluj alebo oprav chýbajúce komponenty a skús skript znova."
   log "Plný precheck prešiel úspešne."
-}
-
-ensure_postgres_db_and_user() {
-  log "Pripravujem PostgreSQL databázu a používateľa..."
-
-  if [[ $DRY_RUN -eq 0 ]]; then
-    if ! postgres_query "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" | grep -q 1; then
-      run_postgres_sql "CREATE ROLE ${DB_USER} WITH LOGIN PASSWORD '${DB_PASS_SQL}';"
-    else
-      log "PostgreSQL rola ${DB_USER} už existuje."
-    fi
-
-    if ! postgres_query "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" | grep -q 1; then
-      run_postgres_sql "CREATE DATABASE ${DB_NAME} OWNER ${DB_USER} ENCODING 'UTF8';"
-    else
-      log "PostgreSQL databáza ${DB_NAME} už existuje."
-    fi
-
-    run_postgres_sql "ALTER DATABASE ${DB_NAME} OWNER TO ${DB_USER};"
-    run_postgres_sql "GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};" >/dev/null
-  else
-    echo "+ create PostgreSQL role ${DB_USER} if missing"
-    echo "+ create PostgreSQL database ${DB_NAME} if missing"
-    echo "+ alter database owner to ${DB_USER}"
-    echo "+ grant all privileges on database ${DB_NAME} to ${DB_USER}"
-  fi
 }
 
 check_cert() {
@@ -289,14 +247,183 @@ check_cert() {
   fi
 }
 
-basic_precheck
-install_packages
-full_precheck
-ensure_postgres_db_and_user
+confirm_reset() {
+  local prompt="$1"
+  if [[ $RESET_ASSUME_YES -eq 1 || $DRY_RUN -eq 1 ]]; then
+    return 0
+  fi
+  read -r -p "$prompt [yes/N]: " reply
+  [[ "$reply" == "yes" ]]
+}
 
-if [[ ! -d "$APP_DIR" ]]; then
-  run_user "composer create-project laravel/laravel '${APP_DIR}'"
+reset_remove_cron() {
+  if ! id "$DOMAIN_USER" >/dev/null 2>&1; then
+    warn "Používateľ ${DOMAIN_USER} neexistuje, cron preskakujem."
+    return 0
+  fi
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "+ remove cron line for ${DOMAIN_USER}: ${CRONLINE}"
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+  if crontab -u "$DOMAIN_USER" -l > "$tmp" 2>/dev/null; then
+    grep -Fvx "$CRONLINE" "$tmp" > "${tmp}.new" || true
+    crontab -u "$DOMAIN_USER" "${tmp}.new"
+    rm -f "$tmp" "${tmp}.new"
+    log "Cron pre ${DOMAIN_USER} bol upravený."
+  else
+    rm -f "$tmp"
+    warn "Používateľ ${DOMAIN_USER} nemá crontab, preskakujem."
+  fi
+}
+
+reset_remove_supervisor() {
+  if [[ -f "$SUPERVISOR_CONF" ]]; then
+    run "rm -f '${SUPERVISOR_CONF}'"
+    if command_exists supervisorctl; then
+      run "supervisorctl reread || true"
+      run "supervisorctl update || true"
+      run "supervisorctl stop ${DOMAIN_USER}-laravel-worker:* || true"
+      run "supervisorctl remove ${DOMAIN_USER}-laravel-worker:* || true"
+    fi
+  else
+    warn "Supervisor config ${SUPERVISOR_CONF} neexistuje, preskakujem."
+  fi
+}
+
+reset_remove_app_dir() {
+  if [[ "$APP_DIR" != /home/${DOMAIN_USER}/* ]]; then
+    die "Bezpečnostná poistka: APP_DIR musí byť pod /home/${DOMAIN_USER}/"
+  fi
+
+  if [[ -d "$APP_DIR" ]]; then
+    run "rm -rf --one-file-system '${APP_DIR}'"
+  else
+    warn "Adresár ${APP_DIR} neexistuje, preskakujem mazanie projektu."
+  fi
+}
+
+reset_drop_db_and_role() {
+  if ! command_exists psql; then
+    die "Chýba psql. Nemôžem zmazať PostgreSQL objekty."
+  fi
+
+  if [[ $RESET_DROP_DB -eq 1 ]]; then
+    log "Mažem PostgreSQL databázu ${DB_NAME}..."
+    run "sudo -u postgres psql -v ON_ERROR_STOP=1 -d postgres -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='${DB_NAME}' AND pid <> pg_backend_pid();\" >/dev/null"
+    run "sudo -u postgres psql -v ON_ERROR_STOP=1 -d postgres -c \"DROP DATABASE IF EXISTS ${DB_NAME};\""
+  fi
+
+  if [[ $RESET_DROP_ROLE -eq 1 ]]; then
+    log "Mažem PostgreSQL rolu ${DB_USER}..."
+    run "sudo -u postgres psql -v ON_ERROR_STOP=1 -d postgres -c \"DROP ROLE IF EXISTS ${DB_USER};\""
+  fi
+}
+
+reset_before_deploy() {
+  [[ $RESET_FIRST -eq 1 ]] || return 0
+
+  log "Bol zadaný --reset-first. Pred deployom vyčistím starý pokus."
+  log "Reset app dir: ${APP_DIR}"
+  log "Reset drop DB: ${RESET_DROP_DB}"
+  log "Reset drop role: ${RESET_DROP_ROLE}"
+
+  if ! confirm_reset "Naozaj chceš pred deployom vymazať existujúci Laravel projekt?"; then
+    die "Reset pred deployom zrušený používateľom."
+  fi
+
+  reset_remove_cron
+  reset_remove_supervisor
+  reset_remove_app_dir
+
+  if [[ $RESET_DROP_DB -eq 1 || $RESET_DROP_ROLE -eq 1 ]]; then
+    if confirm_reset "Pokračovať aj v mazaní PostgreSQL objektov?"; then
+      reset_drop_db_and_role
+    else
+      warn "Mazanie PostgreSQL objektov preskočené."
+    fi
+  fi
+}
+
+ensure_pg_role_and_db() {
+  local escaped_pass
+  escaped_pass="$(sql_escape_literal "$DB_PASS")"
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "+ create PostgreSQL role ${DB_USER} if missing"
+    echo "+ create PostgreSQL database ${DB_NAME} if missing"
+    echo "+ alter PostgreSQL database owner to ${DB_USER}"
+    return 0
+  fi
+
+  log "Pripravujem PostgreSQL databázu a používateľa..."
+
+  if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" | grep -q 1; then
+    sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE ROLE ${DB_USER} WITH LOGIN PASSWORD '${escaped_pass}';"
+  fi
+
+  if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" | grep -q 1; then
+    sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE ${DB_NAME} OWNER ${DB_USER} ENCODING 'UTF8';"
+  fi
+
+  sudo -u postgres psql -v ON_ERROR_STOP=1 -c "ALTER DATABASE ${DB_NAME} OWNER TO ${DB_USER};" >/dev/null
+  sudo -u postgres psql -v ON_ERROR_STOP=1 -d "${DB_NAME}" -c "GRANT ALL ON SCHEMA public TO ${DB_USER};" >/dev/null
+}
+
+ensure_laravel_project() {
+  if [[ -d "$APP_DIR" ]]; then
+    if [[ -f "${APP_DIR}/composer.json" ]]; then
+      log "Laravel projekt už existuje v ${APP_DIR}, preskakujem create-project."
+      return 0
+    fi
+
+    if [[ -z "$(find "$APP_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+      run_user "composer create-project --no-interaction --no-scripts laravel/laravel '${APP_DIR}'"
+      return 0
+    fi
+
+    die "Adresár ${APP_DIR} už existuje a nie je prázdny, ale nevyzerá ako Laravel projekt."
+  fi
+
+  run_user "composer create-project --no-interaction --no-scripts laravel/laravel '${APP_DIR}'"
+}
+
+ensure_migration() {
+  local pattern="$1"
+  local cmd="$2"
+
+  shopt -s nullglob
+  local files=("${APP_DIR}"/database/migrations/*_"${pattern}".php)
+  shopt -u nullglob
+
+  if [[ ${#files[@]} -eq 0 ]]; then
+    if ! run_user "cd '${APP_DIR}' && ${cmd} --no-interaction"; then
+      shopt -s nullglob
+      files=("${APP_DIR}"/database/migrations/*_"${pattern}".php)
+      shopt -u nullglob
+      [[ ${#files[@]} -gt 0 ]] || die "Nepodarilo sa vytvoriť migration ${pattern}"
+    fi
+  fi
+}
+
+basic_precheck
+
+if [[ $SKIP_PACKAGES -eq 0 ]]; then
+  log "Doinštalujem/overím požadované balíky..."
+  run "apt update"
+  run "apt install -y git unzip curl ca-certificates openssl python3 composer postgresql postgresql-client nginx nodejs redis-server supervisor php${PHP_VERSION}-cli php${PHP_VERSION}-fpm php${PHP_VERSION}-pgsql php${PHP_VERSION}-mbstring php${PHP_VERSION}-xml php${PHP_VERSION}-curl php${PHP_VERSION}-zip php${PHP_VERSION}-bcmath php${PHP_VERSION}-intl php${PHP_VERSION}-gd php${PHP_VERSION}-redis"
+  run "systemctl enable --now postgresql redis-server supervisor ${PHP_FPM_SERVICE} nginx"
+else
+  warn "Preskakujem inštaláciu balíkov (--skip-packages)."
 fi
+
+full_precheck
+reset_before_deploy
+ensure_pg_role_and_db
+ensure_laravel_project
 
 run "chown -R ${DOMAIN_USER}:${DOMAIN_USER} '${APP_DIR}'"
 run "mkdir -p '${APP_DIR}/storage/logs' '${APP_DIR}/bootstrap/cache'"
@@ -306,7 +433,9 @@ APP_KEY_CURRENT=""
 [[ -f "${APP_DIR}/.env" ]] && APP_KEY_CURRENT="$(grep -E '^APP_KEY=' "${APP_DIR}/.env" | head -1 | cut -d= -f2- || true)"
 [[ -f "${APP_DIR}/.env" ]] && run "cp '${APP_DIR}/.env' '${APP_DIR}/.env.bak.${TIMESTAMP}'"
 
-cat > "${APP_DIR}/.env" <<EOF_ENV
+DB_PASSWORD_ENV="$(dotenv_escape "$DB_PASS")"
+
+cat > "${APP_DIR}/.env" <<ENVEOF
 APP_NAME=${DOMAIN_USER^^}
 APP_ENV=production
 APP_KEY=${APP_KEY_CURRENT}
@@ -329,7 +458,7 @@ DB_HOST=127.0.0.1
 DB_PORT=5432
 DB_DATABASE=${DB_NAME}
 DB_USERNAME=${DB_USER}
-DB_PASSWORD=${DB_PASS_ENV}
+DB_PASSWORD=${DB_PASSWORD_ENV}
 
 SESSION_DRIVER=file
 SESSION_LIFETIME=120
@@ -364,7 +493,7 @@ AWS_BUCKET=
 AWS_USE_PATH_STYLE_ENDPOINT=false
 
 VITE_APP_NAME="\${APP_NAME}"
-EOF_ENV
+ENVEOF
 run "chown ${DOMAIN_USER}:${DOMAIN_USER} '${APP_DIR}/.env'"
 
 mkdir -p "${APP_DIR}/app/Providers" "${APP_DIR}/app/Providers/Filament"
@@ -391,8 +520,8 @@ class AppServiceProvider extends ServiceProvider
 PHP
 fi
 
-run_user "cd '${APP_DIR}' && composer show livewire/livewire >/dev/null 2>&1 || composer require livewire/livewire"
-run_user "cd '${APP_DIR}' && composer show filament/filament >/dev/null 2>&1 || composer require filament/filament:'^5.0' -W"
+run_user "cd '${APP_DIR}' && composer show livewire/livewire >/dev/null 2>&1 || composer require livewire/livewire --no-interaction"
+run_user "cd '${APP_DIR}' && composer show filament/filament >/dev/null 2>&1 || composer require filament/filament:'^5.0' -W --no-interaction"
 
 cat > "${APP_DIR}/app/Providers/Filament/AdminPanelProvider.php" <<'PHP'
 <?php
@@ -500,7 +629,7 @@ PHP
 run "chown -R ${DOMAIN_USER}:${DOMAIN_USER} '${APP_DIR}/app'"
 
 if [[ -f "$BOOTSTRAP_PROVIDERS" ]]; then
-  if ! grep -q "App\\Providers\\Filament\\AdminPanelProvider::class" "$BOOTSTRAP_PROVIDERS"; then
+  if ! grep -q "App\\\\Providers\\\\Filament\\\\AdminPanelProvider::class" "$BOOTSTRAP_PROVIDERS"; then
     python3 - <<PY
 from pathlib import Path
 p = Path(r"$BOOTSTRAP_PROVIDERS")
@@ -517,14 +646,9 @@ PY
 fi
 
 if [[ $DRY_RUN -eq 0 ]]; then
-  shopt -s nullglob
-  JOB_MIG=("${APP_DIR}"/database/migrations/*_create_jobs_table.php)
-  BATCH_MIG=("${APP_DIR}"/database/migrations/*_create_job_batches_table.php)
-  FAILED_MIG=("${APP_DIR}"/database/migrations/*_create_failed_jobs_table.php)
-  shopt -u nullglob
-  [[ ${#JOB_MIG[@]} -gt 0 ]] || run_user "cd '${APP_DIR}' && php artisan queue:table"
-  [[ ${#BATCH_MIG[@]} -gt 0 ]] || run_user "cd '${APP_DIR}' && php artisan make:queue-batches-table"
-  [[ ${#FAILED_MIG[@]} -gt 0 ]] || run_user "cd '${APP_DIR}' && php artisan queue:failed-table"
+  ensure_migration "create_jobs_table" "php artisan make:queue-table"
+  ensure_migration "create_job_batches_table" "php artisan make:queue-batches-table"
+  ensure_migration "create_failed_jobs_table" "php artisan make:queue-failed-table"
 else
   echo "+ ensure queue migration files exist"
 fi
@@ -534,7 +658,7 @@ run_user "cd '${APP_DIR}' && php artisan storage:link || true"
 run_user "cd '${APP_DIR}' && php artisan migrate --force"
 run_user "cd '${APP_DIR}' && npm install"
 run_user "cd '${APP_DIR}' && npm run build"
-run_user "cd '${APP_DIR}' && composer dump-autoload -o"
+run_user "cd '${APP_DIR}' && composer dump-autoload -o --no-interaction"
 run_user "cd '${APP_DIR}' && php artisan optimize:clear"
 run_user "cd '${APP_DIR}' && php artisan optimize"
 
@@ -543,6 +667,7 @@ run "cp '${NGINX_CONF}' '${NGINX_CONF}.bak.${TIMESTAMP}'"
 python3 - <<PY
 import re
 from pathlib import Path
+
 conf = Path(r"$NGINX_CONF")
 text = conf.read_text()
 
@@ -575,7 +700,6 @@ run "nginx -t"
 run "systemctl restart ${PHP_FPM_SERVICE}"
 run "systemctl restart nginx"
 
-CRONLINE="* * * * * cd ${APP_DIR} && php artisan schedule:run >> /dev/null 2>&1"
 if [[ $DRY_RUN -eq 0 ]]; then
   crontab -u "$DOMAIN_USER" -l 2>/dev/null | grep -F "$CRONLINE" >/dev/null || \
     (crontab -u "$DOMAIN_USER" -l 2>/dev/null; echo "$CRONLINE") | crontab -u "$DOMAIN_USER" -
@@ -583,8 +707,7 @@ else
   echo "+ ensure crontab for ${DOMAIN_USER}: ${CRONLINE}"
 fi
 
-SUPERVISOR_CONF="/etc/supervisor/conf.d/${DOMAIN_USER}-laravel-worker.conf"
-cat > "$SUPERVISOR_CONF" <<EOF_SUP
+cat > "$SUPERVISOR_CONF" <<SUPEREOF
 [program:${DOMAIN_USER}-laravel-worker]
 process_name=%(program_name)s_%(process_num)02d
 command=/usr/bin/php ${APP_DIR}/artisan queue:work --sleep=3 --tries=3 --timeout=90
@@ -598,7 +721,8 @@ numprocs=1
 redirect_stderr=true
 stdout_logfile=${APP_DIR}/storage/logs/worker.log
 stopwaitsecs=3600
-EOF_SUP
+SUPEREOF
+
 run "supervisorctl reread"
 run "supervisorctl update"
 run "supervisorctl restart ${DOMAIN_USER}-laravel-worker:* || supervisorctl start ${DOMAIN_USER}-laravel-worker:*"
