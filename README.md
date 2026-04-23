@@ -1,56 +1,191 @@
 # Virtualmin Laravel Scripts
 
-Parametrický Bash skript na nasadenie **Laravel + Filament + PostgreSQL** na **existujúcej Virtualmin doméne** s **Nginx**.
+A practical deployment toolkit for Laravel + Filament on existing Virtualmin domains with Nginx and PostgreSQL.
 
-Skript je určený na rýchly prvý deploy aj na opakované pokusy pri testovaní. Vie pripraviť Laravel projekt, PostgreSQL databázu, Nginx konfiguráciu, Supervisor worker, cron a voliteľne aj prvého Filament admin používateľa.
+## What this project is
 
-## Čo skript robí
+This repository contains Bash scripts for deploying, resetting, and removing **Laravel + Filament** projects on **existing Virtualmin domains** that use:
 
-- overí prostredie a potrebné služby
-- vie doinštalovať potrebné balíky, ak nepoužiješ `--skip-packages`
-- vytvorí alebo obnoví PostgreSQL databázu a rolu
-- vytvorí nový Laravel projekt
-- doinštaluje Livewire a Filament
-- nastaví `.env`
-- vygeneruje silné heslá, ak ich nezadáš ručne
-- vytvorí prvého admin používateľa do Filamentu
-- publikuje **Filament assety**
-- overí existenciu Filament CSS/JS súborov
-- nastaví alebo opraví Nginx pre Laravel
-- nastaví cron pre `schedule:run`
-- nastaví Supervisor worker pre queue
-- uloží prihlasovacie údaje do root-only súboru v `/root`
+- **Nginx**
+- **PHP-FPM**
+- **PostgreSQL**
+- **Debian-based systems**
 
-## Predpoklady
+The scripts automate the repetitive parts of the deployment workflow so you can provision new Laravel + Filament projects faster and more consistently.
 
-- doména už existuje vo Virtualmine
-- systémový používateľ domény už existuje
-- Nginx a PHP-FPM sú používané pre web
-- skript spúšťaš ako `root`
+## Who this is for
 
-## Hlavný skript
+This project is useful for people who already manage servers with a stack similar to this:
 
-`scripts/setup-laravel-virtualmin.sh`
+- Virtualmin
+- Nginx
+- PHP-FPM
+- PostgreSQL
+- Laravel + Filament
 
-## Základné použitie
+It is especially helpful if you regularly:
+
+- deploy fresh Laravel projects on new domains
+- repeat deployments during testing
+- want consistent database, Nginx, queue, and admin-user setup
+- want generated credentials stored safely for later use
+
+## Who this is not for
+
+This is **not** a general-purpose Laravel installer for arbitrary server setups.
+
+It does **not** create the Virtualmin domain itself, and it assumes the domain already exists.
+
+If your environment is significantly different from the stack above, you will likely need to adapt the scripts.
+
+## What the scripts do
+
+### `scripts/setup-laravel-virtualmin.sh`
+
+Deploys a Laravel + Filament project on an existing Virtualmin domain.
+
+It can:
+
+- verify the environment and required services
+- install required packages unless `--skip-packages` is used
+- create or recreate the PostgreSQL database and role
+- create a new Laravel project
+- install Livewire and Filament
+- configure `.env`
+- generate strong passwords if you do not provide them manually
+- create the first Filament admin user
+- publish and verify Filament assets
+- create or repair the Nginx configuration for Laravel
+- detect SSL certificates and configure HTTPS when available
+- configure cron for `schedule:run`
+- configure a Supervisor worker for queues
+- store generated credentials in a root-only file under `/root`
+
+### `scripts/reset-laravel-virtualmin.sh`
+
+Removes the current Laravel deployment attempt so you can redeploy cleanly.
+
+### `scripts/remove-laravel-virtualmin.sh`
+
+Removes the Laravel project and can also optionally remove:
+
+- PostgreSQL database
+- PostgreSQL role / user
+- Nginx config
+- generated credentials files
+
+## What this project assumes already exists
+
+Before running the setup script, make sure that:
+
+- the Virtualmin domain already exists
+- the domain system user already exists
+- DNS points to the server
+- Nginx and PHP-FPM are available
+- PostgreSQL is available
+- you run the script as `root`
+
+## What makes this useful
+
+This project automates the repetitive parts of deploying Laravel + Filament on Virtualmin, including:
+
+- PostgreSQL database and role creation
+- `.env` generation
+- admin user creation
+- Filament asset publishing and verification
+- Nginx setup
+- SSL detection
+- Supervisor and cron setup
+
+## Quick start
+
+### Dry run first
 
 ```bash
-sudo bash scripts/setup-laravel-virtualmin.sh \
-  --domain nbv.sk \
-  --user nbv
+bash scripts/setup-laravel-virtualmin.sh \
+  --domain example.com \
+  --user exampleuser \
+  --skip-packages \
+  --dry-run
 ```
 
-Ak nezadáš `--db-pass` a `--admin-pass`, skript ich vygeneruje automaticky.
+### First real deployment
 
-## Dôležité prepínače
+```bash
+bash scripts/setup-laravel-virtualmin.sh \
+  --domain example.com \
+  --user exampleuser
+```
 
-### Základné
+If you do not provide `--db-pass` or `--admin-pass`, the script generates them automatically.
+
+## Typical workflows
+
+### 1. First deployment on a new Virtualmin domain
+
+```bash
+bash scripts/setup-laravel-virtualmin.sh \
+  --domain example.com \
+  --user exampleuser
+```
+
+### 2. Repeated clean redeploy during testing
+
+```bash
+bash scripts/setup-laravel-virtualmin.sh \
+  --domain example.com \
+  --user exampleuser \
+  --skip-packages \
+  --reset-first \
+  --reset-drop-db \
+  --reset-drop-role \
+  --reset-yes
+```
+
+### 3. Re-run after a Let's Encrypt certificate has been issued
+
+If the project already exists and you only need to enable HTTPS after issuing a certificate in Virtualmin, run the setup script again **without reset**:
+
+```bash
+bash scripts/setup-laravel-virtualmin.sh \
+  --domain example.com \
+  --user exampleuser \
+  --skip-packages
+```
+
+### 4. Remove the deployment attempt and try again
+
+```bash
+bash scripts/reset-laravel-virtualmin.sh \
+  --domain example.com \
+  --user exampleuser \
+  --drop-db \
+  --drop-role \
+  --yes
+```
+
+### 5. Remove the Laravel project completely
+
+```bash
+bash scripts/remove-laravel-virtualmin.sh \
+  --domain example.com \
+  --user exampleuser \
+  --drop-db \
+  --drop-role \
+  --remove-nginx-conf \
+  --remove-credentials \
+  --yes
+```
+
+## Important options
+
+### Core options
 
 - `--domain DOMAIN`  
-  názov domény, napr. `nbv.sk`
+  Domain name, for example `example.com`
 
 - `--user USER`  
-  systémový používateľ domény, napr. `nbv`
+  Domain system user, for example `exampleuser`
 
 - `--db-name NAME`  
   default: `<user>`
@@ -59,7 +194,7 @@ Ak nezadáš `--db-pass` a `--admin-pass`, skript ich vygeneruje automaticky.
   default: `<user>`
 
 - `--db-pass PASS`  
-  PostgreSQL heslo; ak chýba, skript ho vygeneruje
+  PostgreSQL password; if omitted, the script generates one
 
 - `--app-dir PATH`  
   default: `/home/<user>/laravel-app`
@@ -68,18 +203,18 @@ Ak nezadáš `--db-pass` a `--admin-pass`, skript ich vygeneruje automaticky.
   default: `8.4`
 
 - `--skip-packages`  
-  preskočí `apt install`
+  skips `apt install`
 
 - `--skip-cert-check`  
-  preskočí kontrolu HTTPS certifikátu na konci
+  skips HTTPS certificate validation at the end
 
 - `--dry-run`  
-  iba vypíše kroky bez vykonania zmien
+  prints the steps without applying changes
 
-### Admin používateľ
+### Admin user options
 
 - `--no-admin`  
-  nevytvorí prvého admin používateľa
+  do not create the first admin user
 
 - `--admin-name NAME`  
   default: `Administrator`
@@ -88,159 +223,197 @@ Ak nezadáš `--db-pass` a `--admin-pass`, skript ich vygeneruje automaticky.
   default: `admin@<domain>`
 
 - `--admin-pass PASS`  
-  ak chýba, skript ho vygeneruje
+  if omitted, the script generates one
 
-### Reset pred novým deployom
+### Reset options before a new deployment
 
 - `--reset-first`  
-  zmaže starý Laravel pokus pred novým deployom
+  removes the previous Laravel attempt before deploying again
 
 - `--reset-drop-db`  
-  pri resetovaní zmaže aj PostgreSQL databázu
+  also drops the PostgreSQL database during reset
 
 - `--reset-drop-role`  
-  pri resetovaní zmaže aj PostgreSQL rolu / usera
+  also drops the PostgreSQL role / user during reset
 
 - `--reset-yes`  
-  reset prebehne bez interaktívneho potvrdenia
+  runs the reset without interactive confirmation
 
-## Odporúčaný postup
+## Filament assets
 
-### 1. Test nanečisto
-
-```bash
-bash scripts/setup-laravel-virtualmin.sh \
-  --domain nbv.sk \
-  --user nbv \
-  --skip-packages \
-  --dry-run
-```
-
-### 2. Prvý ostrý deploy
-
-```bash
-bash scripts/setup-laravel-virtualmin.sh \
-  --domain nbv.sk \
-  --user nbv
-```
-
-### 3. Opakovaný čistý pokus
-
-```bash
-bash scripts/setup-laravel-virtualmin.sh \
-  --domain nbv.sk \
-  --user nbv \
-  --skip-packages \
-  --reset-first \
-  --reset-drop-db \
-  --reset-drop-role \
-  --reset-yes
-```
-
-### 4. Oprava Nginx / SSL po vystavení certifikátu
-
-Ak už projekt existuje a potrebuješ len dorobiť HTTPS konfiguráciu po vystavení certifikátu vo Virtualmine, spusti skript znova **bez resetu**:
-
-```bash
-bash scripts/setup-laravel-virtualmin.sh \
-  --domain nbv.sk \
-  --user nbv \
-  --skip-packages
-```
-
-## Filament assety
-
-Skript po inštalácii Filamentu automaticky spustí:
+After installing Filament, the setup script automatically runs:
 
 ```bash
 php artisan filament:assets
 ```
 
-Potom overí, že skutočne existujú aspoň tieto súbory:
+Then it verifies that at least these files exist:
 
 - `public/css/filament/filament/app.css`
 - `public/js/filament/filament/app.js`
 
-Ak sa po prvom publishi nenájdu, skript publish skúsi ešte raz. Ak stále chýbajú, deploy skončí chybou, aby si nedostal rozbitý login bez štýlov.
+If the assets are not found after the first publish, the script tries again. If they are still missing, deployment stops with an error so you do not end up with a broken login page without styles.
 
-## SSL správanie
+## SSL behavior
 
-Skript vie hľadať SSL súbory v týchto cestách:
+The setup script can detect SSL files in these locations:
 
 - `/home/<user>/ssl.combined` + `/home/<user>/ssl.key`
 - `/home/<user>/ssl.cert` + `/home/<user>/ssl.key`
 - `/etc/letsencrypt/live/<domain>/fullchain.pem` + `/etc/letsencrypt/live/<domain>/privkey.pem`
-- fallback aj cez `/etc/letsencrypt/archive/<domain>/`
+- fallback through `/etc/letsencrypt/archive/<domain>/`
 
-Ak sa SSL súbory nájdu, skript pripraví HTTPS Nginx blok automaticky.  
-Ak sa nenájdu, pripraví HTTP-only konfiguráciu a po vystavení certifikátu stačí skript spustiť znova bez resetu.
+If SSL files are found, the script automatically prepares an HTTPS Nginx block.
 
-## Výstup po úspechu
+If they are not found, it prepares an HTTP-only configuration. After issuing the certificate, you can simply run the setup script again without reset.
 
-Po úspešnom behu skript vypíše:
+## Output after success
 
-- URL admin loginu
-- email a heslo admin používateľa
-- PostgreSQL meno databázy, používateľa a heslo
-- cestu k root-only súboru s prihlasovacími údajmi
+After a successful run, the setup script prints:
 
-Príklad:
+- the admin login URL
+- the admin user's email and password
+- the PostgreSQL database name, user, and password
+- the path to the root-only credentials file
+
+Example:
 
 ```text
-Hotovo. Ďalšie kroky:
-1) Skontroluj web: https://nbv.sk/admin/login
-2) Prihlasovacie údaje admin používateľa:
-   Email: admin@nbv.sk
-   Heslo: ...
-3) Databázové údaje:
-   DB name: nbv
-   DB user: nbv
+Done. Next steps:
+1) Check the website: https://example.com/admin/login
+2) Admin credentials:
+   Email: admin@example.com
+   Password: ...
+3) Database credentials:
+   DB name: exampleuser
+   DB user: exampleuser
    DB pass: ...
-4) Uložené aj do root súboru: /root/nbv.sk-deploy-credentials-YYYYMMDD-HHMMSS.txt
+4) Also stored in a root file: /root/example.com-deploy-credentials-YYYYMMDD-HHMMSS.txt
 ```
 
-## Kam sa ukladajú vygenerované heslá
+## Where generated credentials are stored
 
-Skript vytvorí root-only súbor v tvare:
+The script creates a root-only file in this format:
 
 ```text
 /root/<domain>-deploy-credentials-<timestamp>.txt
 ```
 
-Práva sú nastavené na `600`.
+Permissions are set to `600`.
 
-## Poznámky
+## Safety notes
 
-- Pri deployi sa môžu objaviť warningy typu `Migration already exists.` pre voliteľné queue migrácie. To je akceptované a deploy tým nekončí.
-- Ak Nginx vypíše warning typu `listen ... http2 directive is deprecated`, ide o nefatálne upozornenie.
-- Koreňová route `/` nemusí byť definovaná. Dôležitý test po deployi je `https://<domain>/admin/login`.
+Warning:
 
-## Kontrola po deployi
+The reset and remove scripts can delete the Laravel project directory, PostgreSQL database, PostgreSQL role, Nginx config, and generated credentials depending on the options you use.
+
+Always test with `--dry-run` first when you are not fully sure what will happen.
+
+## Troubleshooting
+
+### The login page loads without styles
+
+Run:
 
 ```bash
-openssl s_client -connect nbv.sk:443 -servername nbv.sk </dev/null 2>/dev/null | openssl x509 -noout -subject -issuer -ext subjectAltName
+su - exampleuser
+cd /home/exampleuser/laravel-app
+php artisan filament:assets
+php artisan optimize:clear
+php artisan optimize
 ```
 
-Ak je všetko správne, medzi SAN záznamami uvidíš:
+Then verify that these files exist:
 
-- `DNS:nbv.sk`
-- `DNS:www.nbv.sk`
+- `public/css/filament/filament/app.css`
+- `public/js/filament/filament/app.js`
+
+### HTTPS uses the wrong certificate
+
+Run the setup script again after the correct certificate has been issued:
+
+```bash
+bash scripts/setup-laravel-virtualmin.sh \
+  --domain example.com \
+  --user exampleuser \
+  --skip-packages
+```
+
+Then verify:
+
+```bash
+openssl s_client -connect example.com:443 -servername example.com </dev/null 2>/dev/null | openssl x509 -noout -subject -issuer -ext subjectAltName
+```
+
+SAN should include:
+
+- `DNS:example.com`
+- `DNS:www.example.com`
+
+### The website root returns 404
+
+The root route `/` does not have to be defined. The most important post-deploy test is:
+
+```text
+https://example.com/admin/login
+```
+
+### Optional queue migration warnings appear
+
+Warnings such as `Migration already exists.` for optional queue migrations are acceptable and do not stop the deployment.
+
+## Checks after deployment
+
+### Check Laravel / Filament routes
+
+```bash
+su - exampleuser
+cd /home/exampleuser/laravel-app
+php artisan route:list | grep admin
+```
+
+### Check HTTPS certificate
+
+```bash
+openssl s_client -connect example.com:443 -servername example.com </dev/null 2>/dev/null | openssl x509 -noout -subject -issuer -ext subjectAltName
+```
+
+If everything is correct, SAN should include:
+
+- `DNS:example.com`
+- `DNS:www.example.com`
+
+## GitHub repository description
+
+**Deployment and reset scripts for Laravel + Filament + PostgreSQL on Virtualmin with Nginx.**
+
+Suggested GitHub topics:
+
+- `laravel`
+- `filament`
+- `virtualmin`
+- `nginx`
+- `postgresql`
+- `bash`
+- `deployment`
+- `php`
 
 ## Git workflow
 
-Odporúčaný názov skriptov v repozitári nechaj stabilný:
+Keep stable script names in the repository:
 
 - `scripts/setup-laravel-virtualmin.sh`
 - `scripts/reset-laravel-virtualmin.sh`
+- `scripts/remove-laravel-virtualmin.sh`
 
-Verzie sleduj cez:
+Track versions through:
 
-- commity
-- tagy
+- commits
+- tags
 - GitHub Releases
 
-Nie cez názvy typu `-v4`, `-v5`, `-final-final`.
+Not through file names like `-v4`, `-v5`, or `-final-final`.
 
-## Licencia
+## License
 
-Použi podľa potreby v rámci vlastnej infraštruktúry.
+Use as needed within your own infrastructure and deployment workflow.
