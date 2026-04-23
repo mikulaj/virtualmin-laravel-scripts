@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 usage() {
-  cat <<'EOH'
+  cat <<'USAGE'
 Parametrický setup skript pre Laravel + Filament + PostgreSQL na existujúcej Virtualmin doméne.
 
 Použitie:
@@ -21,10 +21,10 @@ Voliteľné:
   --dry-run                 iba vypíše kroky, nič nemení
 
 Reset pred deployom:
-  --reset-first             pred deployom zmaže existujúci Laravel projekt, cron a supervisor worker
-  --reset-drop-db           pri --reset-first zmaže aj PostgreSQL databázu
-  --reset-drop-role         pri --reset-first zmaže aj PostgreSQL rolu/usera (vyžaduje --reset-drop-db)
-  --reset-yes               pri --reset-first nežiada potvrdenie
+  --reset-first             zmaže starý Laravel pokus pred novým deployom
+  --reset-drop-db           pri resetovaní zmaže aj PostgreSQL databázu
+  --reset-drop-role         pri resetovaní zmaže aj PostgreSQL rolu / usera
+  --reset-yes               nepotvrdzuje reset interaktívne
 
   -h, --help                zobrazí túto nápovedu
 
@@ -33,7 +33,7 @@ Poznámky:
 - Aplikačné kroky bežia vždy cez: su - <user>
 - Nerieši DNS ani vystavenie SSL certifikátu.
 - Vytvorenie Filament admin používateľa necháva na konci ako ručný krok.
-EOH
+USAGE
 }
 
 if [[ $# -eq 0 ]]; then
@@ -54,7 +54,7 @@ DRY_RUN=0
 RESET_FIRST=0
 RESET_DROP_DB=0
 RESET_DROP_ROLE=0
-RESET_ASSUME_YES=0
+RESET_YES=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -71,7 +71,7 @@ while [[ $# -gt 0 ]]; do
     --reset-first) RESET_FIRST=1; shift ;;
     --reset-drop-db) RESET_DROP_DB=1; shift ;;
     --reset-drop-role) RESET_DROP_ROLE=1; shift ;;
-    --reset-yes) RESET_ASSUME_YES=1; shift ;;
+    --reset-yes) RESET_YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
   esac
@@ -79,7 +79,6 @@ done
 
 [[ $EUID -eq 0 ]] || { echo "Skript spusti ako root." >&2; exit 1; }
 [[ -n "$DOMAIN" && -n "$DOMAIN_USER" && -n "$DB_PASS" ]] || { usage; exit 1; }
-[[ $RESET_DROP_ROLE -eq 0 || $RESET_DROP_DB -eq 1 ]] || { echo "--reset-drop-role vyžaduje aj --reset-drop-db" >&2; exit 1; }
 
 DB_NAME="${DB_NAME:-${DOMAIN_USER}_matrika}"
 DB_USER="${DB_USER:-${DOMAIN_USER}_matrika_user}"
@@ -90,8 +89,8 @@ NGINX_ENABLED="/etc/nginx/sites-enabled/${DOMAIN}.conf"
 BOOTSTRAP_PROVIDERS="${APP_DIR}/bootstrap/providers.php"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 PHP_FPM_SERVICE="php${PHP_VERSION}-fpm"
-SUPERVISOR_CONF="/etc/supervisor/conf.d/${DOMAIN_USER}-laravel-worker.conf"
 CRONLINE="* * * * * cd ${APP_DIR} && php artisan schedule:run >> /dev/null 2>&1"
+SUPERVISOR_CONF="/etc/supervisor/conf.d/${DOMAIN_USER}-laravel-worker.conf"
 
 log() { echo "[INFO] $*"; }
 warn() { echo "[WARN] $*" >&2; }
@@ -117,6 +116,53 @@ run_user() {
   fi
 }
 
+write_file() {
+  local path="$1"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "+ write file ${path}"
+    cat >/dev/null
+  else
+    cat >"$path"
+  fi
+}
+
+append_or_replace_cron_line() {
+  local user="$1"
+  local line="$2"
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "+ ensure crontab for ${user}: ${line}"
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+  crontab -u "$user" -l 2>/dev/null | grep -Fvx "$line" >"$tmp" || true
+  echo "$line" >>"$tmp"
+  crontab -u "$user" "$tmp"
+  rm -f "$tmp"
+}
+
+remove_cron_line() {
+  local user="$1"
+  local line="$2"
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "+ remove cron line for ${user}: ${line}"
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+  crontab -u "$user" -l 2>/dev/null | grep -Fvx "$line" >"$tmp" || true
+  if [[ -s "$tmp" ]]; then
+    crontab -u "$user" "$tmp"
+  else
+    crontab -u "$user" -r 2>/dev/null || true
+  fi
+  rm -f "$tmp"
+}
+
 validate_pg_identifier() {
   local value="$1"
   local label="$2"
@@ -137,7 +183,9 @@ dotenv_escape() {
 
 print_versions() {
   command_exists php && php -v | head -1 || true
-  command_exists composer && run_user "composer --version --no-interaction" || true
+  if command_exists composer; then
+    su - "$DOMAIN_USER" -c "composer --version --no-interaction" || true
+  fi
   command_exists node && node -v || true
   command_exists npm && npm -v || true
   command_exists psql && psql --version || true
@@ -168,26 +216,12 @@ full_precheck() {
     fi
   done
 
-  if ! systemctl is-active --quiet postgresql; then
-    warn "Služba postgresql nebeží."
-    failed=1
-  fi
-  if ! systemctl is-active --quiet "$PHP_FPM_SERVICE"; then
-    warn "Služba ${PHP_FPM_SERVICE} nebeží."
-    failed=1
-  fi
-  if ! systemctl is-active --quiet nginx; then
-    warn "Služba nginx nebeží."
-    failed=1
-  fi
-  if ! systemctl is-active --quiet redis-server; then
-    warn "Služba redis-server nebeží."
-    failed=1
-  fi
-  if ! systemctl is-active --quiet supervisor; then
-    warn "Služba supervisor nebeží."
-    failed=1
-  fi
+  for svc in postgresql "$PHP_FPM_SERVICE" nginx redis-server supervisor; do
+    if ! systemctl is-active --quiet "$svc"; then
+      warn "Služba ${svc} nebeží."
+      failed=1
+    fi
+  done
 
   if command_exists php; then
     local phpmods
@@ -247,68 +281,33 @@ check_cert() {
   fi
 }
 
-confirm_reset() {
-  local prompt="$1"
-  if [[ $RESET_ASSUME_YES -eq 1 || $DRY_RUN -eq 1 ]]; then
-    return 0
-  fi
-  read -r -p "$prompt [yes/N]: " reply
-  [[ "$reply" == "yes" ]]
-}
+perform_reset() {
+  log "Bol zadaný --reset-first. Pred deployom vyčistím starý pokus."
+  log "Reset app dir: ${APP_DIR}"
+  log "Reset drop DB: ${RESET_DROP_DB}"
+  log "Reset drop role: ${RESET_DROP_ROLE}"
 
-reset_remove_cron() {
-  if ! id "$DOMAIN_USER" >/dev/null 2>&1; then
-    warn "Používateľ ${DOMAIN_USER} neexistuje, cron preskakujem."
-    return 0
+  if [[ $RESET_YES -eq 0 && $DRY_RUN -eq 0 ]]; then
+    local answer
+    read -r -p "Naozaj zmazať starý Laravel pokus pre ${DOMAIN}? [yes/N] " answer
+    [[ "$answer" == "yes" ]] || die "Reset bol zrušený používateľom."
   fi
 
-  if [[ $DRY_RUN -eq 1 ]]; then
-    echo "+ remove cron line for ${DOMAIN_USER}: ${CRONLINE}"
-    return 0
-  fi
+  remove_cron_line "$DOMAIN_USER" "$CRONLINE"
 
-  local tmp
-  tmp="$(mktemp)"
-  if crontab -u "$DOMAIN_USER" -l > "$tmp" 2>/dev/null; then
-    grep -Fvx "$CRONLINE" "$tmp" > "${tmp}.new" || true
-    crontab -u "$DOMAIN_USER" "${tmp}.new"
-    rm -f "$tmp" "${tmp}.new"
-    log "Cron pre ${DOMAIN_USER} bol upravený."
-  else
-    rm -f "$tmp"
-    warn "Používateľ ${DOMAIN_USER} nemá crontab, preskakujem."
-  fi
-}
-
-reset_remove_supervisor() {
   if [[ -f "$SUPERVISOR_CONF" ]]; then
+    run "supervisorctl stop ${DOMAIN_USER}-laravel-worker:* || true"
     run "rm -f '${SUPERVISOR_CONF}'"
-    if command_exists supervisorctl; then
-      run "supervisorctl reread || true"
-      run "supervisorctl update || true"
-      run "supervisorctl stop ${DOMAIN_USER}-laravel-worker:* || true"
-      run "supervisorctl remove ${DOMAIN_USER}-laravel-worker:* || true"
-    fi
+    run "supervisorctl reread"
+    run "supervisorctl update"
   else
     warn "Supervisor config ${SUPERVISOR_CONF} neexistuje, preskakujem."
-  fi
-}
-
-reset_remove_app_dir() {
-  if [[ "$APP_DIR" != /home/${DOMAIN_USER}/* ]]; then
-    die "Bezpečnostná poistka: APP_DIR musí byť pod /home/${DOMAIN_USER}/"
   fi
 
   if [[ -d "$APP_DIR" ]]; then
     run "rm -rf --one-file-system '${APP_DIR}'"
   else
-    warn "Adresár ${APP_DIR} neexistuje, preskakujem mazanie projektu."
-  fi
-}
-
-reset_drop_db_and_role() {
-  if ! command_exists psql; then
-    die "Chýba psql. Nemôžem zmazať PostgreSQL objekty."
+    warn "Adresár ${APP_DIR} neexistuje, preskakujem mazanie aplikácie."
   fi
 
   if [[ $RESET_DROP_DB -eq 1 ]]; then
@@ -320,31 +319,6 @@ reset_drop_db_and_role() {
   if [[ $RESET_DROP_ROLE -eq 1 ]]; then
     log "Mažem PostgreSQL rolu ${DB_USER}..."
     run "sudo -u postgres psql -v ON_ERROR_STOP=1 -d postgres -c \"DROP ROLE IF EXISTS ${DB_USER};\""
-  fi
-}
-
-reset_before_deploy() {
-  [[ $RESET_FIRST -eq 1 ]] || return 0
-
-  log "Bol zadaný --reset-first. Pred deployom vyčistím starý pokus."
-  log "Reset app dir: ${APP_DIR}"
-  log "Reset drop DB: ${RESET_DROP_DB}"
-  log "Reset drop role: ${RESET_DROP_ROLE}"
-
-  if ! confirm_reset "Naozaj chceš pred deployom vymazať existujúci Laravel projekt?"; then
-    die "Reset pred deployom zrušený používateľom."
-  fi
-
-  reset_remove_cron
-  reset_remove_supervisor
-  reset_remove_app_dir
-
-  if [[ $RESET_DROP_DB -eq 1 || $RESET_DROP_ROLE -eq 1 ]]; then
-    if confirm_reset "Pokračovať aj v mazaní PostgreSQL objektov?"; then
-      reset_drop_db_and_role
-    else
-      warn "Mazanie PostgreSQL objektov preskočené."
-    fi
   fi
 }
 
@@ -421,7 +395,11 @@ else
 fi
 
 full_precheck
-reset_before_deploy
+
+if [[ $RESET_FIRST -eq 1 ]]; then
+  perform_reset
+fi
+
 ensure_pg_role_and_db
 ensure_laravel_project
 
@@ -435,7 +413,7 @@ APP_KEY_CURRENT=""
 
 DB_PASSWORD_ENV="$(dotenv_escape "$DB_PASS")"
 
-cat > "${APP_DIR}/.env" <<ENVEOF
+write_file "${APP_DIR}/.env" <<EOF_ENV
 APP_NAME=${DOMAIN_USER^^}
 APP_ENV=production
 APP_KEY=${APP_KEY_CURRENT}
@@ -493,12 +471,13 @@ AWS_BUCKET=
 AWS_USE_PATH_STYLE_ENDPOINT=false
 
 VITE_APP_NAME="\${APP_NAME}"
-ENVEOF
+EOF_ENV
 run "chown ${DOMAIN_USER}:${DOMAIN_USER} '${APP_DIR}/.env'"
 
-mkdir -p "${APP_DIR}/app/Providers" "${APP_DIR}/app/Providers/Filament"
+run "mkdir -p '${APP_DIR}/app/Providers' '${APP_DIR}/app/Providers/Filament' '${APP_DIR}/app/Models'"
+
 if [[ ! -f "${APP_DIR}/app/Providers/AppServiceProvider.php" ]]; then
-cat > "${APP_DIR}/app/Providers/AppServiceProvider.php" <<'PHP'
+  write_file "${APP_DIR}/app/Providers/AppServiceProvider.php" <<'EOF_PHP'
 <?php
 
 namespace App\Providers;
@@ -517,13 +496,13 @@ class AppServiceProvider extends ServiceProvider
         //
     }
 }
-PHP
+EOF_PHP
 fi
 
 run_user "cd '${APP_DIR}' && composer show livewire/livewire >/dev/null 2>&1 || composer require livewire/livewire --no-interaction"
 run_user "cd '${APP_DIR}' && composer show filament/filament >/dev/null 2>&1 || composer require filament/filament:'^5.0' -W --no-interaction"
 
-cat > "${APP_DIR}/app/Providers/Filament/AdminPanelProvider.php" <<'PHP'
+write_file "${APP_DIR}/app/Providers/Filament/AdminPanelProvider.php" <<'EOF_PHP'
 <?php
 
 namespace App\Providers\Filament;
@@ -583,9 +562,9 @@ class AdminPanelProvider extends PanelProvider
             ]);
     }
 }
-PHP
+EOF_PHP
 
-cat > "${APP_DIR}/app/Models/User.php" <<'PHP'
+write_file "${APP_DIR}/app/Models/User.php" <<'EOF_PHP'
 <?php
 
 namespace App\Models;
@@ -624,24 +603,31 @@ class User extends Authenticatable implements FilamentUser
         return true;
     }
 }
-PHP
+EOF_PHP
 
 run "chown -R ${DOMAIN_USER}:${DOMAIN_USER} '${APP_DIR}/app'"
 
 if [[ -f "$BOOTSTRAP_PROVIDERS" ]]; then
   if ! grep -q "App\\\\Providers\\\\Filament\\\\AdminPanelProvider::class" "$BOOTSTRAP_PROVIDERS"; then
-    python3 - <<PY
+    if [[ $DRY_RUN -eq 1 ]]; then
+      echo "+ add AdminPanelProvider to ${BOOTSTRAP_PROVIDERS}"
+    else
+      export BOOTSTRAP_PROVIDERS
+      python3 - <<'PY'
+import os
 from pathlib import Path
-p = Path(r"$BOOTSTRAP_PROVIDERS")
+
+p = Path(os.environ["BOOTSTRAP_PROVIDERS"])
 text = p.read_text()
 marker = 'return ['
-insert = "return [\n    App\\\\Providers\\\\Filament\\\\AdminPanelProvider::class,"
+insert = "return [\n    App\\Providers\\Filament\\AdminPanelProvider::class,"
 if marker in text:
     text = text.replace(marker, insert, 1)
 else:
     raise SystemExit('Neviem upraviť bootstrap/providers.php')
 p.write_text(text)
 PY
+    fi
   fi
 fi
 
@@ -664,20 +650,34 @@ run_user "cd '${APP_DIR}' && php artisan optimize"
 
 require_file "$NGINX_CONF"
 run "cp '${NGINX_CONF}' '${NGINX_CONF}.bak.${TIMESTAMP}'"
-python3 - <<PY
+
+export DOMAIN APP_PUBLIC_DIR NGINX_CONF
+if [[ $DRY_RUN -eq 0 ]]; then
+  python3 - <<'PY'
+import os
 import re
 from pathlib import Path
 
-conf = Path(r"$NGINX_CONF")
+conf = Path(os.environ["NGINX_CONF"])
 text = conf.read_text()
 
-domain = r"$DOMAIN"
-app_public = r"$APP_PUBLIC_DIR"
+domain = os.environ["DOMAIN"]
+app_public = os.environ["APP_PUBLIC_DIR"]
 
 text = re.sub(r"server_name\s+[^;]+;", f"server_name {domain} www.{domain};", text, count=1)
 text = re.sub(r"root\s+[^;]+;", f"root {app_public};", text, count=1)
-text = re.sub(r'fastcgi_param\s+SCRIPT_FILENAME\s+"[^"]+\\\$fastcgi_script_name";', f'fastcgi_param SCRIPT_FILENAME "{app_public}\\$fastcgi_script_name";', text, count=1)
-text = re.sub(r"fastcgi_param\s+DOCUMENT_ROOT\s+[^;]+;", f"fastcgi_param DOCUMENT_ROOT {app_public};", text, count=1)
+text = re.sub(
+    r'fastcgi_param\s+SCRIPT_FILENAME\s+"[^"]+\$fastcgi_script_name";',
+    f'fastcgi_param SCRIPT_FILENAME "{app_public}\\$fastcgi_script_name";',
+    text,
+    count=1,
+)
+text = re.sub(
+    r"fastcgi_param\s+DOCUMENT_ROOT\s+[^;]+;",
+    f"fastcgi_param DOCUMENT_ROOT {app_public};",
+    text,
+    count=1,
+)
 
 text = re.sub(r"\n\s*if \(\$host = webmail\.[^\n]+\{[\s\S]*?\n\s*\}", "", text, count=1)
 text = re.sub(r"\n\s*if \(\$host = admin\.[^\n]+\{[\s\S]*?\n\s*\}", "", text, count=1)
@@ -686,10 +686,18 @@ if 'location / {' not in text:
     replacement = "location ^~ /.well-known/ {\n\t\ttry_files $uri /;\n\t}\n\tlocation / {\n\t\ttry_files $uri $uri/ /index.php?$query_string;\n\t}"
     text = text.replace("location ^~ /.well-known/ {\n\t\ttry_files $uri /;\n\t}", replacement, 1)
 else:
-    text = re.sub(r"location / \{[\s\S]*?\}", "location / {\n\t\ttry_files $uri $uri/ /index.php?$query_string;\n\t}", text, count=1)
+    text = re.sub(
+        r"location / \{[\s\S]*?\}",
+        "location / {\n\t\ttry_files $uri $uri/ /index.php?$query_string;\n\t}",
+        text,
+        count=1,
+    )
 
 conf.write_text(text)
 PY
+else
+  echo "+ update nginx config ${NGINX_CONF} for Laravel root ${APP_PUBLIC_DIR}"
+fi
 
 if [[ ! -L "$NGINX_ENABLED" ]]; then
   run "rm -f '${NGINX_ENABLED}'"
@@ -700,14 +708,9 @@ run "nginx -t"
 run "systemctl restart ${PHP_FPM_SERVICE}"
 run "systemctl restart nginx"
 
-if [[ $DRY_RUN -eq 0 ]]; then
-  crontab -u "$DOMAIN_USER" -l 2>/dev/null | grep -F "$CRONLINE" >/dev/null || \
-    (crontab -u "$DOMAIN_USER" -l 2>/dev/null; echo "$CRONLINE") | crontab -u "$DOMAIN_USER" -
-else
-  echo "+ ensure crontab for ${DOMAIN_USER}: ${CRONLINE}"
-fi
+append_or_replace_cron_line "$DOMAIN_USER" "$CRONLINE"
 
-cat > "$SUPERVISOR_CONF" <<SUPEREOF
+write_file "$SUPERVISOR_CONF" <<EOF_SUP
 [program:${DOMAIN_USER}-laravel-worker]
 process_name=%(program_name)s_%(process_num)02d
 command=/usr/bin/php ${APP_DIR}/artisan queue:work --sleep=3 --tries=3 --timeout=90
@@ -721,7 +724,7 @@ numprocs=1
 redirect_stderr=true
 stdout_logfile=${APP_DIR}/storage/logs/worker.log
 stopwaitsecs=3600
-SUPEREOF
+EOF_SUP
 
 run "supervisorctl reread"
 run "supervisorctl update"
@@ -732,6 +735,7 @@ run_user "cd '${APP_DIR}' && php artisan route:list | grep admin || true"
 check_cert
 
 echo
+
 echo "Hotovo. Ďalšie kroky:"
 echo "1) Skontroluj web: https://${DOMAIN}/admin/login"
 echo "2) Vytvor Filament admin usera ako ${DOMAIN_USER}:"
