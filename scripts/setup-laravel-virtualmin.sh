@@ -459,6 +459,59 @@ install_filament() {
   fi
 }
 
+
+configure_filament_user_model() {
+  [[ "$INSTALL_FILAMENT" -eq 1 ]] || return 0
+
+  log "Nastavujem prístup používateľa do Filament panelu"
+
+  cat > "$APP_DIR/app/Models/User.php" <<'PHP'
+<?php
+
+namespace App\Models;
+
+use Filament\Models\Contracts\FilamentUser;
+use Filament\Panel;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Foundation\Auth\User as Authenticatable;
+use Illuminate\Notifications\Notifiable;
+
+class User extends Authenticatable implements FilamentUser
+{
+    /** @use HasFactory<\Database\Factories\UserFactory> */
+    use HasFactory, Notifiable;
+
+    protected $fillable = [
+        'name',
+        'email',
+        'password',
+    ];
+
+    protected $hidden = [
+        'password',
+        'remember_token',
+    ];
+
+    protected function casts(): array
+    {
+        return [
+            'email_verified_at' => 'datetime',
+            'password' => 'hashed',
+        ];
+    }
+
+    public function canAccessPanel(Panel $panel): bool
+    {
+        return true;
+    }
+}
+PHP
+
+  chown "$APP_USER:$APP_USER" "$APP_DIR/app/Models/User.php"
+
+  ok "Používateľský model povoľuje prístup do Filamentu"
+}
+
 run_laravel_maintenance() {
   log "Spúšťam Laravel údržbu"
 
@@ -696,6 +749,7 @@ main() {
   ensure_laravel_app
   configure_laravel_env
   install_filament
+  configure_filament_user_model
   run_laravel_maintenance
   create_admin_user
   configure_nginx_for_laravel
